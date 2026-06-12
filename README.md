@@ -166,7 +166,9 @@ P-256 signature over the SHA-256 digest of everything before it.
 The tests port the canonical test matrix shared by the .NET, Go, and
 JavaScript implementations. The compatibility suite parses the base 64
 fixtures from the JavaScript test suite and asserts byte exact round trips,
-proving the wire format matches the other languages.
+proving the wire format matches the other languages. The interop suite
+verifies fixtures signed by the Go and .NET implementations, proving that
+verification works across languages and not just within this one.
 
 ```bash
 cargo test
