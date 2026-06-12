@@ -1,0 +1,31 @@
+[package]
+name = "owid"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Simple cryptographically auditable identifiers and processors implemented in Rust."
+repository = "https://github.com/SWAN-community/owid-rust"
+keywords = ["owid", "swan", "identifier", "audit", "signature"]
+categories = ["cryptography", "encoding"]
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+ureq = { version = "2", optional = true }
+
+[features]
+default = []
+# Helpers for hosting the well known end points required by the OWID
+# specification.
+endpoints = ["dep:serde", "dep:serde_json"]
+# Verification that fetches the creator public key over HTTP from the well
+# known end point. Not available on WebAssembly targets where the host
+# environment provides HTTP access instead.
+fetch = ["dep:ureq"]
+
+[package.metadata.docs.rs]
+all-features = true
