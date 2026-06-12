@@ -12,24 +12,18 @@ about the concepts before looking into this implementation.
 
 ## Scope of this implementation
 
-This library creates, signs, serializes, and verifies OWIDs. It provides the
-same features as the [.NET](https://github.com/SWAN-community/owid-dotnet)
-and [Go](https://github.com/SWAN-community/owid-go) implementations, allowing
-for language specific differences.
+This library creates, signs, serializes, and verifies OWIDs. It covers the
+full library contract of the OWID specification, including reading the
+deprecated earlier versions of the data structure.
 
 The core crate performs no network access and compiles for WebAssembly
 targets such as `wasm32-wasip1`, which makes it suitable for edge computing
 environments. Two optional features extend it.
 
-* `fetch` adds verification that retrieves the creator public key over HTTP
-  from the well known end point and caches it. This mirrors the domain based
-  verification in the .NET and Go implementations.
+* `fetch` adds domain based verification that retrieves the creator public
+  key over HTTP from the well known end point and caches it.
 * `endpoints` adds framework agnostic helpers for hosting the well known end
   points that an OWID creator must serve.
-
-The Go implementation additionally contains a complete creator service with
-storage backends and registration pages. That is hosting infrastructure
-rather than part of the library contract, so it is not reproduced here.
 
 ## Installation
 
@@ -139,52 +133,38 @@ let body = endpoints::public_key_response(&creator, "spki")?;
 |`Owid::verify_with_crypto`, `verify_with_public_key`|Verify the signature, optionally with the other OWIDs that were signed together.|
 |`Owid::verify`|Verify by fetching the creator public key over HTTP (`fetch` feature).|
 |`Creator::sign`, `sign_with_others`, `sign_string`, `sign_bytes`|Create and sign OWIDs. Signing sets the domain and the date.|
-|`Crypto::new`, `new_sign_only`, `new_verify_only`|Generate or import keys. Private keys are accepted in PKCS#8 and SEC1 PEM forms, matching the forms produced by the .NET and Go implementations.|
+|`Crypto::new`, `new_sign_only`, `new_verify_only`|Generate or import keys. Private keys are accepted in both PKCS#8 and SEC1 PEM forms.|
 |`Crypto::public_key_pem`, `private_key_pem`|Export keys as PEM.|
 
-## Data structure and language specific notes
+## Data structure notes
 
-The binary format is identical to the other implementations. One byte
-version, null terminated domain, date as minutes since 2020-01-01 UTC in a
-little endian unsigned 32 bit integer (two byte big endian hours for the
-deprecated version 1), payload length and payload, then the 64 byte ECDSA
-P-256 signature over the SHA-256 digest of everything before it.
+The binary format is a one byte version, a null terminated domain, the date
+as minutes since 2020-01-01 UTC in a little endian unsigned 32 bit integer
+(two byte big endian hours for the deprecated version 1), the payload length
+and payload, then the 64 byte ECDSA P-256 signature over the SHA-256 digest
+of everything before it.
 
-* String payloads use UTF-8, the same as Go and JavaScript. The .NET
-  implementation is ASCII only for its string convenience APIs.
-* The deprecated version 1 date field follows the .NET reading of hours
-  since the base date. The Go implementation read the same two bytes as
-  days.
-* `payload_as_printable` returns zero padded lower case hexadecimal. The
-  exact hexadecimal formatting differs between every implementation.
-* Signatures are deterministic (RFC 6979), unlike the randomized signatures
-  produced by .NET and Go. Both kinds verify everywhere because the
-  verification algorithm is the same.
+* String payloads are encoded as UTF-8.
+* The deprecated version 1 date field stores a two byte big endian count of
+  hours since the base date.
+* `payload_as_printable` returns zero padded lower case hexadecimal.
+* Base 64 is accepted with or without padding. Output is always padded.
+* Signatures are deterministic (RFC 6979). Verification accepts any valid
+  ECDSA P-256 signature, whether produced deterministically or with a
+  random nonce, because the verification algorithm is the same for both.
 
 ## Testing
 
-The tests port the canonical test matrix shared by the .NET, Go, and
-JavaScript implementations. The compatibility suite parses the base 64
-fixtures from the JavaScript test suite and asserts byte exact round trips,
-proving the wire format matches the other languages. The interop suite
-verifies fixtures signed by the Go and .NET implementations, proving that
-verification works across languages and not just within this one.
+The unit tests cover creation, signing, serialization, and verification
+across all supported versions. The compatibility and interop suites include
+externally produced fixtures, with byte exact round trips and verification
+of signatures generated outside this library, proving that the wire format
+and the signature verification are portable.
 
 ```bash
 cargo test
 cargo test --all-features
 ```
-
-## Related repositories
-
-* [owid](https://github.com/SWAN-community/owid) defines the OWID
-  specification and concepts.
-* [owid-dotnet](https://github.com/SWAN-community/owid-dotnet) is the .NET
-  implementation. It creates, signs and verifies OWIDs server side.
-* [owid-go](https://github.com/SWAN-community/owid-go) is the Go
-  implementation. It creates, signs and verifies OWIDs server side.
-* [owid-js](https://github.com/SWAN-community/owid-js) is the JavaScript
-  implementation. It verifies OWIDs in the browser.
 
 ## License
 

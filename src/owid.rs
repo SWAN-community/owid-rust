@@ -28,9 +28,8 @@ use crate::io;
 use crate::version::Version;
 
 /// Base 64 engine that writes the standard alphabet with padding, and reads
-/// strings with or without padding. The JavaScript implementation produces
-/// strings without padding whilst Go and .NET pad, so reading must accept
-/// both.
+/// strings with or without padding. Encoded OWIDs occur both with and
+/// without padding, so reading must accept both.
 const BASE64: GeneralPurpose = GeneralPurpose::new(
     &alphabet::STANDARD,
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),

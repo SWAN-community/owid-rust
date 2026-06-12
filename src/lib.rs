@@ -21,11 +21,7 @@
 //!
 //! Read the [OWID](https://github.com/SWAN-community/owid) project to learn
 //! more about the concepts before looking into this implementation. This
-//! crate provides the same features as the
-//! [.NET](https://github.com/SWAN-community/owid-dotnet),
-//! [Go](https://github.com/SWAN-community/owid-go), and
-//! [JavaScript](https://github.com/SWAN-community/owid-js) implementations,
-//! allowing for language specific differences.
+//! crate creates, signs, serializes, and verifies OWIDs.
 //!
 //! ## Data structure
 //!
