@@ -65,6 +65,9 @@ impl Crypto {
     ///
     /// Returns [`Error::Key`] if the PEM is not a valid P-256 private key.
     pub fn new_sign_only(private_pem: &str) -> Result<Self> {
+        if private_pem.trim().is_empty() {
+            return Err(Error::Key("private key PEM is empty".to_owned()));
+        }
         let signing_key = SigningKey::from_pkcs8_pem(private_pem)
             .or_else(|_| SecretKey::from_sec1_pem(private_pem).map(SigningKey::from))
             .map_err(|e| Error::Key(e.to_string()))?;
@@ -82,6 +85,9 @@ impl Crypto {
     ///
     /// Returns [`Error::Key`] if the PEM is not a valid P-256 public key.
     pub fn new_verify_only(public_pem: &str) -> Result<Self> {
+        if public_pem.trim().is_empty() {
+            return Err(Error::Key("public key PEM is empty".to_owned()));
+        }
         let verifying_key =
             VerifyingKey::from_public_key_pem(public_pem).map_err(|e| Error::Key(e.to_string()))?;
         Ok(Crypto {
@@ -239,6 +245,26 @@ mod tests {
     fn invalid_private_pem() {
         let result = Crypto::new_sign_only("invalid");
         assert!(result.is_err(), "bad private PEM should error");
+    }
+
+    /// An empty public PEM is rejected by the explicit guard.
+    #[test]
+    fn empty_public_pem() {
+        let result = Crypto::new_verify_only("");
+        assert!(
+            matches!(result, Err(Error::Key(_))),
+            "empty public PEM should error with Error::Key"
+        );
+    }
+
+    /// An empty private PEM is rejected by the explicit guard.
+    #[test]
+    fn empty_private_pem() {
+        let result = Crypto::new_sign_only("");
+        assert!(
+            matches!(result, Err(Error::Key(_))),
+            "empty private PEM should error with Error::Key"
+        );
     }
 
     /// Port of the Go TestCrypto test. Keys exported to PEM and imported
