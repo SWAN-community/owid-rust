@@ -148,7 +148,11 @@ impl Owid {
     /// Returns [`Error::InvalidSignatureLength`] if the OWID has not been
     /// signed, or other errors if the fields can not be encoded.
     pub fn as_byte_array(&self) -> Result<Vec<u8>> {
+        let capacity = self.encoded_len(true)?;
         let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(capacity)
+            .map_err(|_| Error::ImplementationCapacityExceeded { required: capacity })?;
         self.to_buffer(&mut buffer)?;
         Ok(buffer)
     }
@@ -191,12 +195,58 @@ impl Owid {
     /// fields of this OWID without the signature, followed by the complete
     /// byte form of each of the others in the order provided.
     pub(crate) fn data_for_crypto(&self, others: &[&Owid]) -> Result<Vec<u8>> {
+        let mut capacity = self.encoded_len(false)?;
+        for other in others {
+            capacity = capacity.checked_add(other.encoded_len(true)?).ok_or(
+                Error::ImplementationCapacityExceeded {
+                    required: usize::MAX,
+                },
+            )?;
+        }
         let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(capacity)
+            .map_err(|_| Error::ImplementationCapacityExceeded { required: capacity })?;
         self.to_buffer_no_signature(&mut buffer)?;
         for other in others {
             other.to_buffer(&mut buffer)?;
         }
         Ok(buffer)
+    }
+
+    /// The exact number of bytes written for this OWID.
+    fn encoded_len(&self, include_signature: bool) -> Result<usize> {
+        if self.payload.len() > u32::MAX as usize {
+            return Err(Error::PayloadTooLarge(self.payload.len()));
+        }
+        if include_signature && self.signature.len() != crate::SIGNATURE_LENGTH {
+            return Err(Error::InvalidSignatureLength(self.signature.len()));
+        }
+        let date_len = match self.version {
+            Version::Version1 => 2,
+            Version::Version2 | Version::Version3 => 4,
+            other => return Err(Error::UnsupportedVersion(other.as_byte())),
+        };
+        let lengths = [
+            1,
+            self.domain.len(),
+            1,
+            date_len,
+            4,
+            self.payload.len(),
+            if include_signature {
+                crate::SIGNATURE_LENGTH
+            } else {
+                0
+            },
+        ];
+        lengths.into_iter().try_fold(0usize, |total, length| {
+            total
+                .checked_add(length)
+                .ok_or(Error::ImplementationCapacityExceeded {
+                    required: usize::MAX,
+                })
+        })
     }
 
     /// The payload interpreted as a string. Bytes that are not valid UTF-8

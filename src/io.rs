@@ -105,7 +105,13 @@ impl<'a> Reader<'a> {
         let expected = count.and_then(|c| c.checked_add(SIGNATURE_LENGTH));
         match (count, expected) {
             (Some(count), Some(expected)) if expected == present => {
-                Ok(self.read_bytes(count)?.to_vec())
+                let bytes = self.read_bytes(count)?;
+                let mut payload = Vec::new();
+                payload
+                    .try_reserve_exact(count)
+                    .map_err(|_| Error::ImplementationCapacityExceeded { required: count })?;
+                payload.extend_from_slice(bytes);
+                Ok(payload)
             }
             _ => Err(Error::PayloadLengthMismatch { declared, present }),
         }

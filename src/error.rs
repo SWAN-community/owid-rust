@@ -51,6 +51,12 @@ pub enum Error {
     DateOutOfRange,
     /// The payload is larger than the unsigned 32 bit length prefix allows.
     PayloadTooLarge(usize),
+    /// The OWID is structurally valid, but this implementation could not
+    /// reserve the bytes needed to own or serialize it.
+    ImplementationCapacityExceeded {
+        /// The number of bytes the operation attempted to reserve.
+        required: usize,
+    },
     /// A key could not be imported, exported, or used. The string contains
     /// the underlying error message.
     Key(String),
@@ -100,6 +106,10 @@ impl fmt::Display for Error {
             Error::PayloadTooLarge(l) => {
                 write!(f, "payload length '{l}' exceeds the unsigned 32 bit limit")
             }
+            Error::ImplementationCapacityExceeded { required } => write!(
+                f,
+                "OWID requires '{required}' bytes beyond this implementation's capacity"
+            ),
             Error::Key(e) => write!(f, "key operation failed because {e}"),
             Error::KeyMissing(o) => {
                 write!(f, "instance of Crypto cannot be used to {o}")

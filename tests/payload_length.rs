@@ -102,7 +102,8 @@ fn signature() -> Vec<u8> {
 /// last 64 bytes, and the envelope parses to the same payload. The parse
 /// is measured as well, and must have requested at least the payload and
 /// signature bytes it copied, which proves the allocation count sees what
-/// the parser does and so the bound in the huge length test is real.
+/// the parser does and so the bound in the mismatched declaration test is
+/// real.
 #[test]
 fn declared_length_matches_parses() {
     let payload = payload();
@@ -118,6 +119,19 @@ fn declared_length_matches_parses() {
         "a parse that copies {} bytes requested only {allocated}",
         payload.len() + signature.len()
     );
+}
+
+/// A payload that is materially larger than ordinary identifiers remains
+/// valid when the declaration and bytes agree. This is a regression check
+/// against introducing an implementation policy limit into format parsing.
+#[test]
+fn matching_one_mebibyte_payload_parses() {
+    let payload = vec![0x5a; 1024 * 1024];
+    let bytes = envelope(payload.len() as u32, &payload, &signature());
+
+    let parsed = Owid::from_byte_array(&bytes).expect("matching payload should parse");
+
+    assert_eq!(parsed.payload, payload);
 }
 
 /// A round trip through the crate's own signing path still parses, so the
@@ -211,13 +225,14 @@ fn short_signature_is_refused() {
     );
 }
 
-/// A declared length far beyond the bytes present is refused without an
-/// allocation sized by the declared number. The envelope is a few dozen
-/// bytes and declares 64 MiB, then 2 GiB, then the most an unsigned 32 bit
-/// length can hold, and each refusal requests under 64 KiB from the
-/// allocator.
+/// A large declaration whose payload bytes are absent is refused without
+/// an allocation sized by the declared number. The envelope is a few dozen
+/// bytes while declaring 64 MiB, then 2 GiB, then the most an unsigned 32
+/// bit length can hold. The numeric values remain valid when the matching
+/// payload is present, while each malformed refusal here requests under
+/// 64 KiB from the allocator.
 #[test]
-fn huge_declared_length_is_refused_without_allocating() {
+fn mismatched_large_declaration_is_refused_without_allocating() {
     for declared in [64u32 * 1024 * 1024, 0x7FFF_FFFF, 0xFFFF_FFFF] {
         let bytes = envelope(declared, &[], &[]);
         let (result, allocated) = allocated_by(|| Owid::from_byte_array(&bytes));
