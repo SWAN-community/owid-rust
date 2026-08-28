@@ -85,14 +85,34 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
-    /// Reads a byte array prefixed with its length as an unsigned 32 bit
-    /// integer.
-    pub(crate) fn read_byte_array(&mut self) -> Result<Vec<u8>> {
-        let count = self.read_u32()? as usize;
-        Ok(self.read_bytes(count)?.to_vec())
+    /// Reads the payload, which is prefixed with its length as an unsigned
+    /// 32 bit integer and is the last variable length field of an OWID,
+    /// followed by the signature and nothing else. The length is whatever
+    /// the sender declared, so it is checked against the bytes present
+    /// before anything is sized by it. The declared length must equal the
+    /// bytes remaining less the signature length, and any other length,
+    /// short or long, is refused here with
+    /// [`Error::PayloadLengthMismatch`]. A byte after the signature fails
+    /// this check as well. Until 28 August 2026 the parser only checked
+    /// that the declared count fitted in the buffer, so trailing bytes
+    /// were ignored, and it copied the payload from a slice, so a huge
+    /// declared count never sized an allocation, which the tests in
+    /// `tests/payload_length.rs` now hold the parser to.
+    pub(crate) fn read_payload(&mut self) -> Result<Vec<u8>> {
+        let declared = self.read_u32()?;
+        let present = self.buffer.len() - self.position;
+        let count = usize::try_from(declared).ok();
+        let expected = count.and_then(|c| c.checked_add(SIGNATURE_LENGTH));
+        match (count, expected) {
+            (Some(count), Some(expected)) if expected == present => {
+                Ok(self.read_bytes(count)?.to_vec())
+            }
+            _ => Err(Error::PayloadLengthMismatch { declared, present }),
+        }
     }
 
-    /// Reads the fixed length signature.
+    /// Reads the fixed length signature. After [`Reader::read_payload`]
+    /// exactly this many bytes remain, so the read cannot fall short.
     pub(crate) fn read_signature(&mut self) -> Result<Vec<u8>> {
         Ok(self.read_bytes(SIGNATURE_LENGTH)?.to_vec())
     }

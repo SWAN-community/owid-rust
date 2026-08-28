@@ -107,14 +107,23 @@ impl Owid {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedVersion`] if the first byte is not a
-    /// known version, or [`Error::UnexpectedEndOfBuffer`] if the buffer is
-    /// too short for the remaining fields.
+    /// known version, [`Error::UnexpectedEndOfBuffer`] if the buffer ends
+    /// before the payload length field, or
+    /// [`Error::PayloadLengthMismatch`] if the declared payload length
+    /// does not leave exactly the 64 byte signature at the end of the
+    /// buffer. The declared length is checked against the bytes present
+    /// before the payload is copied, so a buffer that declares a huge
+    /// payload it does not carry is refused without an allocation of that
+    /// size.
     pub fn from_byte_array(buffer: &[u8]) -> Result<Self> {
         let mut reader = io::Reader::new(buffer);
         Owid::from_reader(&mut reader)
     }
 
-    /// Creates an OWID by reading the next fields from the reader.
+    /// Creates an OWID by reading the fields from the reader. The reader
+    /// must hold exactly one OWID, because the payload length check in
+    /// [`io::Reader::read_payload`] requires the signature to be the end of
+    /// the buffer.
     pub(crate) fn from_reader(reader: &mut io::Reader<'_>) -> Result<Self> {
         let version = Version::try_from(reader.read_byte()?)?;
         if version == Version::Empty {
@@ -127,7 +136,7 @@ impl Owid {
             version,
             domain: reader.read_string()?,
             date: reader.read_date(version)?,
-            payload: reader.read_byte_array()?,
+            payload: reader.read_payload()?,
             signature: reader.read_signature()?,
         })
     }

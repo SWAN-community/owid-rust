@@ -29,6 +29,17 @@ pub enum Error {
     InvalidSignatureLength(usize),
     /// The buffer ended before all the expected fields were read.
     UnexpectedEndOfBuffer,
+    /// The declared payload length does not leave exactly the signature
+    /// after the payload. `declared` is the length the sender wrote in the
+    /// four byte length field and `present` is the number of bytes that
+    /// follow the length field, of which the final
+    /// [`crate::SIGNATURE_LENGTH`] must be the signature.
+    PayloadLengthMismatch {
+        /// The payload length read from the length field.
+        declared: u32,
+        /// The bytes present after the length field.
+        present: usize,
+    },
     /// The base 64 string could not be decoded.
     Base64(base64::DecodeError),
     /// The domain is empty, or contains a null character which would
@@ -70,6 +81,13 @@ impl fmt::Display for Error {
             Error::UnexpectedEndOfBuffer => {
                 write!(f, "buffer ended before the OWID was complete")
             }
+            Error::PayloadLengthMismatch { declared, present } => write!(
+                f,
+                "OWID payload length '{declared}' does not match the \r
+                 '{present}' bytes present, of which the final '{}' must \r
+                 be the signature",
+                crate::SIGNATURE_LENGTH
+            ),
             Error::Base64(e) => write!(f, "base 64 decoding failed because {e}"),
             Error::InvalidDomain(d) => write!(f, "domain '{d}' is not valid"),
             Error::InvalidDomainEncoding => {

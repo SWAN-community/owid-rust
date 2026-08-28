@@ -41,6 +41,11 @@
 //! the base date. Versions 1 and 2 are deprecated and supported for reading
 //! existing data only.
 //!
+//! The signature is the end of the OWID. When reading, the payload length
+//! must leave exactly the 64 signature bytes after the payload, so a buffer
+//! with bytes after the signature, or with fewer than 64 bytes after the
+//! payload, is refused as malformed.
+//!
 //! ## Signing
 //!
 //! The signing algorithm generates a SHA-256 digest of the OWID data
