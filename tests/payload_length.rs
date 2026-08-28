@@ -163,11 +163,16 @@ fn declared_length_off_by_one_is_refused() {
             ),
             "declared {declared} should be refused as a mismatch, got {error:?}"
         );
+        let message = error.to_string();
+        assert!(
+            !message.chars().any(char::is_control),
+            "message must not contain control characters: {message:?}"
+        );
         assert_eq!(
-            error.to_string(),
+            message,
             format!(
-                "OWID payload length '{declared}' does not match the \r
-                 '{present}' bytes present, of which the final '64' must \r
+                "OWID payload length '{declared}' does not match the \
+                 '{present}' bytes present, of which the final '64' must \
                  be the signature"
             ),
             "message should name both lengths"

@@ -83,8 +83,8 @@ impl fmt::Display for Error {
             }
             Error::PayloadLengthMismatch { declared, present } => write!(
                 f,
-                "OWID payload length '{declared}' does not match the \r
-                 '{present}' bytes present, of which the final '{}' must \r
+                "OWID payload length '{declared}' does not match the \
+                 '{present}' bytes present, of which the final '{}' must \
                  be the signature",
                 crate::SIGNATURE_LENGTH
             ),
