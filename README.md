@@ -91,14 +91,14 @@ Add the crate to `Cargo.toml`.
 
 ```toml
 [dependencies]
-owid = "0.1"
+owid = "2"
 ```
 
 Enable the optional features as needed.
 
 ```toml
 [dependencies]
-owid = { version = "0.1", features = ["fetch", "endpoints"] }
+owid = { version = "2", features = ["fetch", "endpoints"] }
 ```
 
 ## Usage
