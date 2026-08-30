@@ -108,13 +108,14 @@ impl Owid {
     ///
     /// Returns [`Error::UnsupportedVersion`] if the first byte is not a
     /// known version, [`Error::UnexpectedEndOfBuffer`] if the buffer ends
-    /// before the payload length field, or
-    /// [`Error::PayloadLengthMismatch`] if the declared payload length
-    /// does not leave exactly the 64 byte signature at the end of the
-    /// buffer. The declared length is checked against the bytes present
-    /// before the payload is copied, so a buffer that declares a huge
-    /// payload it does not carry is refused without an allocation of that
-    /// size.
+    /// before the payload length field, [`Error::DomainTooLong`] if the
+    /// domain has no null terminator within the maximum length of a
+    /// domain name, or [`Error::PayloadLengthMismatch`] if the declared
+    /// payload length does not leave exactly the 64 byte signature at the
+    /// end of the buffer. Neither variable length field is read beyond
+    /// what the format allows, so a buffer that declares a huge payload it
+    /// does not carry, or that never terminates its domain, is refused
+    /// without the work growing with the size of the buffer.
     pub fn from_byte_array(buffer: &[u8]) -> Result<Self> {
         let mut reader = io::Reader::new(buffer);
         Owid::from_reader(&mut reader)
@@ -134,7 +135,7 @@ impl Owid {
         }
         Ok(Owid {
             version,
-            domain: reader.read_string()?,
+            domain: reader.read_domain()?,
             date: reader.read_date(version)?,
             payload: reader.read_payload()?,
             signature: reader.read_signature()?,

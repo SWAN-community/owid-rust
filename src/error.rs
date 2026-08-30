@@ -47,6 +47,12 @@ pub enum Error {
     InvalidDomain(String),
     /// The domain bytes read from the buffer are not valid UTF-8.
     InvalidDomainEncoding,
+    /// The domain field has no null terminator within the published
+    /// maximum length of a domain name, so the domain is either longer
+    /// than a domain name can be or its terminator is missing. The parse
+    /// refuses the buffer at that point rather than reading on, so the
+    /// cost of a buffer with no terminator does not grow with its length.
+    DomainTooLong,
     /// The date can not be represented in the encoding used by the version.
     DateOutOfRange,
     /// The payload is larger than the unsigned 32 bit length prefix allows.
@@ -99,6 +105,11 @@ impl fmt::Display for Error {
             Error::InvalidDomainEncoding => {
                 write!(f, "domain bytes are not valid UTF-8")
             }
+            Error::DomainTooLong => write!(
+                f,
+                "domain has no null terminator within the '{}' character maximum",
+                crate::io::MAXIMUM_DOMAIN_LENGTH
+            ),
             Error::DateOutOfRange => write!(
                 f,
                 "date can not be stored in the encoding for the OWID version"

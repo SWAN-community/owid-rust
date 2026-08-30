@@ -46,6 +46,11 @@
 //! with bytes after the signature, or with fewer than 64 bytes after the
 //! payload, is refused as malformed.
 //!
+//! The domain is found by reading forward to its null terminator, and that
+//! read stops at the maximum length a domain name is allowed to be, so a
+//! buffer whose terminator is missing or corrupted is refused rather than
+//! read to the end.
+//!
 //! ## Signing
 //!
 //! The signing algorithm generates a SHA-256 digest of the OWID data

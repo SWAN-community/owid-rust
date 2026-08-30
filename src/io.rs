@@ -24,6 +24,20 @@ use crate::error::{Error, Result};
 use crate::version::Version;
 use crate::SIGNATURE_LENGTH;
 
+/// The longest creator domain an envelope may carry, counted in
+/// characters of the text form. RFC 1035 section 2.3.4, "Size limits",
+/// says that "the total length of a domain name (i.e., label octets and
+/// label length octets) is restricted to 255 octets or less", and that
+/// "labels must be 63 characters or less". Those 255 octets are the wire
+/// format, which puts a length octet in front of every label and a zero
+/// octet at the end for the root. An OWID stores the presentation form
+/// instead, the text `example.com`, which writes a dot in place of each
+/// of those length octets except the first, because nothing precedes the
+/// first label, and writes nothing at all for the root. Two of the 255
+/// octets therefore have no text counterpart, so the same published
+/// limit is two characters fewer here.
+pub(crate) const MAXIMUM_DOMAIN_LENGTH: usize = 253;
+
 /// The base date for OWIDs. The date and time information is stored in hours
 /// or minutes after this date.
 pub(crate) fn base_date() -> DateTime<Utc> {
@@ -67,13 +81,33 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
-    /// Reads bytes until the null terminator and returns them as a string.
-    pub(crate) fn read_string(&mut self) -> Result<String> {
+    /// Reads the creator domain, which is stored as text followed by a
+    /// null terminator. The terminator is whatever the sender wrote, so
+    /// the search for it stops after [`MAXIMUM_DOMAIN_LENGTH`] characters
+    /// rather than running on to the end of the buffer. A buffer whose
+    /// domain field carries no terminator within that many characters is
+    /// refused with [`Error::DomainTooLong`] and the rest of the buffer is
+    /// never touched, so the work a hostile buffer can ask for here is
+    /// fixed by the constant and not by the length of the input. A buffer
+    /// that simply runs out before a terminator is still
+    /// [`Error::UnexpectedEndOfBuffer`], as it was before the bound was
+    /// added on 30 August 2026, which the tests in
+    /// `tests/payload_length.rs` hold the parser to.
+    pub(crate) fn read_domain(&mut self) -> Result<String> {
         let remaining = &self.buffer[self.position..];
-        let terminator = remaining
+        let window = remaining.len().min(MAXIMUM_DOMAIN_LENGTH + 1);
+        // A window wide enough to hold the terminator of the longest
+        // domain allowed, with no terminator in it, means the domain is
+        // too long. A narrower one means the buffer ran out first.
+        let missing = if window > MAXIMUM_DOMAIN_LENGTH {
+            Error::DomainTooLong
+        } else {
+            Error::UnexpectedEndOfBuffer
+        };
+        let terminator = remaining[..window]
             .iter()
             .position(|&b| b == 0)
-            .ok_or(Error::UnexpectedEndOfBuffer)?;
+            .ok_or(missing)?;
         let value = String::from_utf8(remaining[..terminator].to_vec())
             .map_err(|_| Error::InvalidDomainEncoding)?;
         self.position += terminator + 1;
@@ -263,7 +297,7 @@ mod tests {
         write_string(&mut buffer, "example.com").expect("should write string");
         assert_eq!(buffer.last(), Some(&0), "should be null terminated");
         let mut reader = Reader::new(&buffer);
-        let result = reader.read_string().expect("should read string");
+        let result = reader.read_domain().expect("should read string");
         assert_eq!(result, "example.com", "should match the original string");
     }
 
