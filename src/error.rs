@@ -47,11 +47,15 @@ pub enum Error {
     InvalidDomain(String),
     /// The domain bytes read from the buffer are not valid UTF-8.
     InvalidDomainEncoding,
-    /// The domain field has no null terminator within the published
-    /// maximum length of a domain name, so the domain is either longer
-    /// than a domain name can be or its terminator is missing. The parse
-    /// refuses the buffer at that point rather than reading on, so the
-    /// cost of a buffer with no terminator does not grow with its length.
+    /// The domain field is longer than the published maximum length of a
+    /// domain name. Reading, the field has no null terminator within that
+    /// many characters, so the domain is either longer than a domain name
+    /// can be or its terminator is missing, and the parse refuses the
+    /// buffer at that point rather than reading on, so the cost of a
+    /// buffer with no terminator does not grow with its length. Writing,
+    /// the domain supplied is longer than the maximum, so it is refused
+    /// when it is supplied rather than serialized into an OWID this crate
+    /// would then refuse to read.
     DomainTooLong,
     /// The date can not be represented in the encoding used by the version.
     DateOutOfRange,
@@ -107,7 +111,7 @@ impl fmt::Display for Error {
             }
             Error::DomainTooLong => write!(
                 f,
-                "domain has no null terminator within the '{}' character maximum",
+                "domain field exceeds the '{}' character maximum",
                 crate::io::MAXIMUM_DOMAIN_LENGTH
             ),
             Error::DateOutOfRange => write!(

@@ -49,7 +49,10 @@
 //! The domain is found by reading forward to its null terminator, and that
 //! read stops at the maximum length a domain name is allowed to be, so a
 //! buffer whose terminator is missing or corrupted is refused rather than
-//! read to the end.
+//! read to the end. The same maximum binds a creator, so a longer domain
+//! is refused when it is supplied and again when an OWID carrying it is
+//! serialized, which keeps this crate from writing something it would
+//! refuse to read.
 //!
 //! ## Signing
 //!

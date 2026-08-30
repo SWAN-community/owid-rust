@@ -28,7 +28,11 @@
 //! sender controls, because the parser finds its end by reading forward to
 //! a null terminator, so the tests for the bound on that read live here as
 //! well and share the counting allocator, which a test binary can only
-//! register once.
+//! register once. The same maximum binds what this crate writes, so the
+//! tests that a longer domain is refused when a creator is built, and
+//! again when an OWID carrying one is serialized, are here too. The unit
+//! tests in `src/creator.rs` and `src/io.rs` check the same boundary
+//! against the constant itself, which an integration test can not see.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -323,7 +327,7 @@ fn domain_over_maximum_is_refused() {
     );
     assert_eq!(
         error.to_string(),
-        "domain has no null terminator within the '253' character maximum",
+        "domain field exceeds the '253' character maximum",
         "message should name the maximum"
     );
 }
@@ -387,6 +391,63 @@ fn short_unterminated_domain_is_end_of_buffer() {
         matches!(error, Error::UnexpectedEndOfBuffer),
         "a short unterminated domain should be an end of buffer, got {error:?}"
     );
+}
+
+/// A creator can not be built for a domain one character over the
+/// maximum, so the crate can not sign an OWID whose domain it would then
+/// refuse to read. The bound is applied where the caller supplies the
+/// domain, so the refusal arrives before any signing or serializing.
+#[test]
+fn creator_over_maximum_domain_is_refused() {
+    let domain = domain_of_length(254);
+    let error = Creator::new(&domain, Crypto::new()).expect_err("should refuse");
+    assert!(
+        matches!(error, Error::DomainTooLong),
+        "a creator domain over the maximum should be refused, got {error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "domain field exceeds the '253' character maximum",
+        "message should name the maximum"
+    );
+}
+
+/// An OWID whose domain was set through the public field, rather than by
+/// a creator, is refused when it is serialized, so the bound is not
+/// avoided by that route. Everything else about the OWID is well formed,
+/// including a full length signature, so the domain is the only thing
+/// wrong with it.
+#[test]
+fn serializing_over_maximum_domain_is_refused() {
+    let owid = Owid {
+        domain: domain_of_length(254),
+        payload: payload(),
+        signature: signature(),
+        ..Owid::default()
+    };
+    let error = owid.as_byte_array().expect_err("should refuse");
+    assert!(
+        matches!(error, Error::DomainTooLong),
+        "serializing a domain over the maximum should be refused, got {error:?}"
+    );
+}
+
+/// An OWID whose domain is exactly the maximum still serializes and
+/// parses back, so the write bound refuses nothing the read accepts.
+#[test]
+fn serializing_maximum_domain_succeeds() {
+    let owid = Owid {
+        domain: domain_of_length(253),
+        payload: payload(),
+        signature: signature(),
+        ..Owid::default()
+    };
+    let bytes = owid
+        .as_byte_array()
+        .expect("the longest valid domain should serialize");
+    let parsed = Owid::from_byte_array(&bytes).expect("should parse back");
+    assert_eq!(parsed.domain, owid.domain, "domain should round trip");
+    assert_eq!(parsed.payload, owid.payload, "payload should round trip");
 }
 
 /// The crate signs and parses back an OWID whose domain is the maximum

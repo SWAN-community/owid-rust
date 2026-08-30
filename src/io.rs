@@ -35,7 +35,10 @@ use crate::SIGNATURE_LENGTH;
 /// of those length octets except the first, because nothing precedes the
 /// first label, and writes nothing at all for the root. Two of the 255
 /// octets therefore have no text counterpart, so the same published
-/// limit is two characters fewer here.
+/// limit is two characters fewer here. The OWID specification makes the
+/// limit binding on a creator as well as on a consumer, so it bounds the
+/// write in [`write_domain`] and in [`crate::Creator::new`] as well as
+/// the read in [`Reader::read_domain`].
 pub(crate) const MAXIMUM_DOMAIN_LENGTH: usize = 253;
 
 /// The base date for OWIDs. The date and time information is stored in hours
@@ -179,11 +182,26 @@ pub(crate) fn write_byte(buffer: &mut Vec<u8>, value: u8) {
     buffer.push(value);
 }
 
-/// Writes the string followed by the null terminator. The string must not
-/// contain a null character as that would conflict with the terminator.
-pub(crate) fn write_string(buffer: &mut Vec<u8>, value: &str) -> Result<()> {
+/// Writes the creator domain followed by the null terminator. The domain
+/// must not contain a null character as that would conflict with the
+/// terminator, and must not be longer than [`MAXIMUM_DOMAIN_LENGTH`],
+/// which [`Reader::read_domain`] refuses on the way back in, so writing a
+/// longer one would produce an OWID this crate could not read.
+///
+/// This is the second of the two places the write bound is applied, the
+/// first being [`crate::Creator::new`]. The bound is repeated here because
+/// [`crate::Owid::domain`] is a public field, so a domain can reach the
+/// serializer without passing through a creator. What is counted is the
+/// bytes the value occupies once written, which is what the read then
+/// measures. The method is named for the domain rather than for strings
+/// because the domain is its only caller, matching
+/// [`Reader::read_domain`].
+pub(crate) fn write_domain(buffer: &mut Vec<u8>, value: &str) -> Result<()> {
     if value.bytes().any(|b| b == 0) {
         return Err(Error::InvalidDomain(value.to_owned()));
+    }
+    if value.len() > MAXIMUM_DOMAIN_LENGTH {
+        return Err(Error::DomainTooLong);
     }
     buffer.extend_from_slice(value.as_bytes());
     buffer.push(0);
@@ -294,11 +312,40 @@ mod tests {
     #[test]
     fn string_roundtrip() {
         let mut buffer = Vec::new();
-        write_string(&mut buffer, "example.com").expect("should write string");
+        write_domain(&mut buffer, "example.com").expect("should write the domain");
         assert_eq!(buffer.last(), Some(&0), "should be null terminated");
         let mut reader = Reader::new(&buffer);
         let result = reader.read_domain().expect("should read string");
         assert_eq!(result, "example.com", "should match the original string");
+    }
+
+    /// A domain of exactly the maximum length is written and read back
+    /// unchanged, so the write bound refuses nothing the read accepts.
+    /// The maximum is read from the constant rather than spelled out,
+    /// because what is checked is that the two halves stop in the same
+    /// place.
+    #[test]
+    fn write_domain_accepts_maximum_length() {
+        let value = "a".repeat(MAXIMUM_DOMAIN_LENGTH);
+        let mut buffer = Vec::new();
+        write_domain(&mut buffer, &value).expect("should write the longest domain");
+        let mut reader = Reader::new(&buffer);
+        let result = reader.read_domain().expect("should read it back");
+        assert_eq!(result, value, "should round trip the longest domain");
+    }
+
+    /// One character more is refused, and nothing is appended, so a caller
+    /// filling a buffer is not left with part of a domain in it.
+    #[test]
+    fn write_domain_over_maximum_is_refused() {
+        let value = "a".repeat(MAXIMUM_DOMAIN_LENGTH + 1);
+        let mut buffer = Vec::new();
+        let error = write_domain(&mut buffer, &value).expect_err("should refuse");
+        assert!(
+            matches!(error, Error::DomainTooLong),
+            "a domain over the maximum should be refused, got {error:?}"
+        );
+        assert!(buffer.is_empty(), "should write nothing when refusing");
     }
 
     /// Unsigned 32 bit integers use little endian byte order.

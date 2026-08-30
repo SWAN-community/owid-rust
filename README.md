@@ -29,15 +29,23 @@ environments. Two optional features extend it.
 
 The OWID wire format stores the payload length as an unsigned 32 bit value,
 so a payload from zero through 4,294,967,295 bytes is structurally valid. The
-format defines no smaller payload limit. The null-terminated domain has no
-separate encoded maximum, so the protocol alone is not an application input
-limit for the complete envelope.
+format defines no smaller payload limit. The null terminated domain is capped
+at 253 characters, so that field is at most 254 bytes with its terminator,
+which leaves the payload as the only part of the envelope the protocol leaves
+open ended, so the protocol alone is not an application input limit for the
+complete envelope.
 
 This crate validates that the declared payload length agrees with the bytes
 present before it sizes or copies the payload. A large declaration without
 the corresponding bytes is malformed and is rejected without allocating the
 declared size. A matching large payload is not malformed merely because it is
 large, and parsing work and memory use scale with the bytes actually present.
+
+The 253 character domain maximum binds this crate on both sides. A buffer
+whose domain field runs past it is refused when it is read, and a domain
+longer than it is refused when a `Creator` is built and again when an OWID
+carrying it is serialized, so the crate will not emit an OWID that it would
+then refuse to read.
 
 The owned APIs remain subject to the target's `usize`, address-space and
 available-memory limits. Applications accepting untrusted OWIDs must choose
@@ -170,6 +178,10 @@ as minutes since 2020-01-01 UTC in a little endian unsigned 32 bit integer
 and payload, then the 64 byte ECDSA P-256 signature over the SHA-256 digest
 of everything before it.
 
+* The domain is at most 253 characters. RFC 1035 section 2.3.4 restricts a
+  domain name to 255 octets in wire form, counting the length octet before
+  each label and the octet for the root, so the presentation form stored
+  here holds two characters fewer.
 * String payloads are encoded as UTF-8.
 * The deprecated version 1 date field stores a two byte big endian count of
   hours since the base date.

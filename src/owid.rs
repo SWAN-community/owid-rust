@@ -147,7 +147,9 @@ impl Owid {
     /// # Errors
     ///
     /// Returns [`Error::InvalidSignatureLength`] if the OWID has not been
-    /// signed, or other errors if the fields can not be encoded.
+    /// signed, [`Error::DomainTooLong`] if the domain is longer than the
+    /// maximum a domain name may be, or other errors if the fields can not
+    /// be encoded.
     pub fn as_byte_array(&self) -> Result<Vec<u8>> {
         let capacity = self.encoded_len(true)?;
         let mut buffer = Vec::new();
@@ -184,10 +186,12 @@ impl Owid {
     }
 
     /// Appends the fields other than the signature to the buffer. This is
-    /// the data over which the signature is calculated.
+    /// the data over which the signature is calculated, so a domain longer
+    /// than a domain name may be is refused here, before any signature is
+    /// computed over it.
     pub(crate) fn to_buffer_no_signature(&self, buffer: &mut Vec<u8>) -> Result<()> {
         io::write_byte(buffer, self.version.as_byte());
-        io::write_string(buffer, &self.domain)?;
+        io::write_domain(buffer, &self.domain)?;
         io::write_date(buffer, &self.date, self.version)?;
         io::write_byte_array(buffer, &self.payload)
     }
