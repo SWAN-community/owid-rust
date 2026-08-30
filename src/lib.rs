@@ -41,6 +41,19 @@
 //! the base date. Versions 1 and 2 are deprecated and supported for reading
 //! existing data only.
 //!
+//! The signature is the end of the OWID. When reading, the payload length
+//! must leave exactly the 64 signature bytes after the payload, so a buffer
+//! with bytes after the signature, or with fewer than 64 bytes after the
+//! payload, is refused as malformed.
+//!
+//! The domain is found by reading forward to its null terminator, and that
+//! read stops at the maximum length a domain name is allowed to be, so a
+//! buffer whose terminator is missing or corrupted is refused rather than
+//! read to the end. The same maximum binds a creator, so a longer domain
+//! is refused when it is supplied and again when an OWID carrying it is
+//! serialized, which keeps this crate from writing something it would
+//! refuse to read.
+//!
 //! ## Signing
 //!
 //! The signing algorithm generates a SHA-256 digest of the OWID data

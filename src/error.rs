@@ -29,6 +29,17 @@ pub enum Error {
     InvalidSignatureLength(usize),
     /// The buffer ended before all the expected fields were read.
     UnexpectedEndOfBuffer,
+    /// The declared payload length does not leave exactly the signature
+    /// after the payload. `declared` is the length the sender wrote in the
+    /// four byte length field and `present` is the number of bytes that
+    /// follow the length field, of which the final
+    /// [`crate::SIGNATURE_LENGTH`] must be the signature.
+    PayloadLengthMismatch {
+        /// The payload length read from the length field.
+        declared: u32,
+        /// The bytes present after the length field.
+        present: usize,
+    },
     /// The base 64 string could not be decoded.
     Base64(base64::DecodeError),
     /// The domain is empty, or contains a null character which would
@@ -36,10 +47,26 @@ pub enum Error {
     InvalidDomain(String),
     /// The domain bytes read from the buffer are not valid UTF-8.
     InvalidDomainEncoding,
+    /// The domain field is longer than the published maximum length of a
+    /// domain name. Reading, the field has no null terminator within that
+    /// many characters, so the domain is either longer than a domain name
+    /// can be or its terminator is missing, and the parse refuses the
+    /// buffer at that point rather than reading on, so the cost of a
+    /// buffer with no terminator does not grow with its length. Writing,
+    /// the domain supplied is longer than the maximum, so it is refused
+    /// when it is supplied rather than serialized into an OWID this crate
+    /// would then refuse to read.
+    DomainTooLong,
     /// The date can not be represented in the encoding used by the version.
     DateOutOfRange,
     /// The payload is larger than the unsigned 32 bit length prefix allows.
     PayloadTooLarge(usize),
+    /// The OWID is structurally valid, but this implementation could not
+    /// reserve the bytes needed to own or serialize it.
+    ImplementationCapacityExceeded {
+        /// The number of bytes the operation attempted to reserve.
+        required: usize,
+    },
     /// A key could not be imported, exported, or used. The string contains
     /// the underlying error message.
     Key(String),
@@ -70,11 +97,23 @@ impl fmt::Display for Error {
             Error::UnexpectedEndOfBuffer => {
                 write!(f, "buffer ended before the OWID was complete")
             }
+            Error::PayloadLengthMismatch { declared, present } => write!(
+                f,
+                "OWID payload length '{declared}' does not match the \
+                 '{present}' bytes present, of which the final '{}' must \
+                 be the signature",
+                crate::SIGNATURE_LENGTH
+            ),
             Error::Base64(e) => write!(f, "base 64 decoding failed because {e}"),
             Error::InvalidDomain(d) => write!(f, "domain '{d}' is not valid"),
             Error::InvalidDomainEncoding => {
                 write!(f, "domain bytes are not valid UTF-8")
             }
+            Error::DomainTooLong => write!(
+                f,
+                "domain field exceeds the '{}' character maximum",
+                crate::io::MAXIMUM_DOMAIN_LENGTH
+            ),
             Error::DateOutOfRange => write!(
                 f,
                 "date can not be stored in the encoding for the OWID version"
@@ -82,6 +121,10 @@ impl fmt::Display for Error {
             Error::PayloadTooLarge(l) => {
                 write!(f, "payload length '{l}' exceeds the unsigned 32 bit limit")
             }
+            Error::ImplementationCapacityExceeded { required } => write!(
+                f,
+                "OWID requires '{required}' bytes beyond this implementation's capacity"
+            ),
             Error::Key(e) => write!(f, "key operation failed because {e}"),
             Error::KeyMissing(o) => {
                 write!(f, "instance of Crypto cannot be used to {o}")

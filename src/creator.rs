@@ -18,6 +18,7 @@ use chrono::Utc;
 
 use crate::crypto::Crypto;
 use crate::error::{Error, Result};
+use crate::io::MAXIMUM_DOMAIN_LENGTH;
 use crate::owid::Owid;
 
 /// Configuration for a [`Creator`] where the domain and keys come from
@@ -51,8 +52,9 @@ impl Creator {
     /// # Errors
     ///
     /// Returns [`Error::InvalidDomain`] if the domain is empty or
-    /// whitespace, or [`Error::KeyMissing`] if the crypto instance can not
-    /// sign.
+    /// whitespace, [`Error::DomainTooLong`] if the domain is longer than
+    /// the maximum a domain name may be, or [`Error::KeyMissing`] if the
+    /// crypto instance can not sign.
     ///
     /// # Examples
     ///
@@ -66,6 +68,14 @@ impl Creator {
     pub fn new(domain: &str, crypto: Crypto) -> Result<Self> {
         if domain.trim().is_empty() {
             return Err(Error::InvalidDomain(domain.to_owned()));
+        }
+        // Refused here, where the caller supplies the domain, so a creator
+        // that could only produce OWIDs this crate refuses to read never
+        // exists, and nothing is signed before the caller is told. The
+        // count is of bytes because the domain field carries the bytes and
+        // the read measures them.
+        if domain.len() > MAXIMUM_DOMAIN_LENGTH {
+            return Err(Error::DomainTooLong);
         }
         if !crypto.can_sign() {
             return Err(Error::KeyMissing("generate a signature"));
@@ -82,7 +92,9 @@ impl Creator {
     /// # Errors
     ///
     /// Returns [`Error::InvalidDomain`] if the domain is empty or
-    /// whitespace, or [`Error::Key`] if the private key PEM is not valid.
+    /// whitespace, [`Error::DomainTooLong`] if the domain is longer than
+    /// the maximum a domain name may be, or [`Error::Key`] if the private
+    /// key PEM is not valid.
     pub fn from_configuration(configuration: &Configuration) -> Result<Self> {
         let crypto = Crypto::new_sign_only(&configuration.private_key)?;
         Creator::new(&configuration.domain, crypto)
@@ -152,5 +164,116 @@ impl Creator {
         };
         self.sign(&mut owid)?;
         Ok(owid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A domain of the length given, built from labels of the 63
+    /// characters RFC 1035 section 2.3.4 allows, separated by dots, so the
+    /// value is a domain in shape as well as in length.
+    fn domain_of_length(length: usize) -> String {
+        let mut value = String::new();
+        while value.len() < length {
+            if !value.is_empty() {
+                value.push('.');
+            }
+            let label = (length - value.len()).min(63);
+            for _ in 0..label {
+                value.push('a');
+            }
+        }
+        assert_eq!(value.len(), length, "should build the length asked for");
+        value
+    }
+
+    /// The longest domain allowed is accepted, signs, and the OWID it
+    /// produces reads back with the same domain. These tests read the
+    /// maximum from the constant rather than spelling the number out,
+    /// because what they check is that the write stops exactly where the
+    /// read does. The number itself is pinned by the tests in
+    /// `tests/payload_length.rs`, which can not see a crate private
+    /// constant.
+    #[test]
+    fn domain_of_maximum_length_is_accepted() {
+        let domain = domain_of_length(MAXIMUM_DOMAIN_LENGTH);
+        let creator = Creator::new(&domain, Crypto::new()).expect("should create the creator");
+        let owid = creator.sign_string("Hello World").expect("should sign");
+        let bytes = owid.as_byte_array().expect("should serialize");
+        let parsed = Owid::from_byte_array(&bytes).expect("should parse back");
+        assert_eq!(parsed.domain, domain, "domain should round trip");
+        assert_eq!(parsed.payload, owid.payload, "payload should round trip");
+    }
+
+    /// One character more than the maximum is refused where the domain is
+    /// supplied, so the creator never exists and nothing it would have
+    /// signed is produced.
+    #[test]
+    fn domain_over_maximum_is_refused() {
+        let domain = domain_of_length(MAXIMUM_DOMAIN_LENGTH + 1);
+        let error = Creator::new(&domain, Crypto::new()).expect_err("should refuse");
+        assert!(
+            matches!(error, Error::DomainTooLong),
+            "a domain one character over the maximum should be refused, got {error:?}"
+        );
+        let expected =
+            format!("domain field exceeds the '{MAXIMUM_DOMAIN_LENGTH}' character maximum");
+        assert_eq!(
+            error.to_string(),
+            expected,
+            "message should name the maximum"
+        );
+    }
+
+    /// The domain is refused before the crypto instance is looked at, so a
+    /// creator given both a long domain and a key that can not sign
+    /// reports the domain. Signing is the only work this type does, and
+    /// the refusal arrives before the key that would do it is examined, so
+    /// no signature can have been computed over a domain that will be
+    /// refused.
+    #[test]
+    fn domain_is_refused_before_the_key_is_examined() {
+        let public_pem = Crypto::new()
+            .public_key_pem()
+            .expect("should export the public key");
+        let verify_only = Crypto::new_verify_only(&public_pem).expect("should import the key");
+        assert!(!verify_only.can_sign(), "should not be able to sign");
+        let domain = domain_of_length(MAXIMUM_DOMAIN_LENGTH + 1);
+        let error = Creator::new(&domain, verify_only).expect_err("should refuse");
+        assert!(
+            matches!(error, Error::DomainTooLong),
+            "the domain should be refused before the key, got {error:?}"
+        );
+    }
+
+    /// A configuration carrying a long domain is refused as well, so the
+    /// bound is not avoided by building a creator from settings.
+    #[test]
+    fn configuration_with_long_domain_is_refused() {
+        let crypto = Crypto::new();
+        let configuration = Configuration {
+            domain: domain_of_length(MAXIMUM_DOMAIN_LENGTH + 1),
+            private_key: crypto.private_key_pem().expect("should export the key"),
+            public_key: None,
+        };
+        let error = Creator::from_configuration(&configuration).expect_err("should refuse");
+        assert!(
+            matches!(error, Error::DomainTooLong),
+            "a long domain in configuration should be refused, got {error:?}"
+        );
+    }
+
+    /// An empty domain is the invalid domain error it was before the
+    /// length bound was added, so the bound has not taken over an
+    /// unrelated case.
+    #[test]
+    fn empty_domain_is_still_invalid_domain() {
+        let error = Creator::new("   ", Crypto::new()).expect_err("should refuse");
+        assert!(
+            matches!(&error, Error::InvalidDomain(d) if d.as_str() == "   "),
+            "an empty domain should stay the invalid domain error, got {error:?}"
+        );
     }
 }

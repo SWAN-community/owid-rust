@@ -107,14 +107,24 @@ impl Owid {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedVersion`] if the first byte is not a
-    /// known version, or [`Error::UnexpectedEndOfBuffer`] if the buffer is
-    /// too short for the remaining fields.
+    /// known version, [`Error::UnexpectedEndOfBuffer`] if the buffer ends
+    /// before the payload length field, [`Error::DomainTooLong`] if the
+    /// domain has no null terminator within the maximum length of a
+    /// domain name, or [`Error::PayloadLengthMismatch`] if the declared
+    /// payload length does not leave exactly the 64 byte signature at the
+    /// end of the buffer. Neither variable length field is read beyond
+    /// what the format allows, so a buffer that declares a huge payload it
+    /// does not carry, or that never terminates its domain, is refused
+    /// without the work growing with the size of the buffer.
     pub fn from_byte_array(buffer: &[u8]) -> Result<Self> {
         let mut reader = io::Reader::new(buffer);
         Owid::from_reader(&mut reader)
     }
 
-    /// Creates an OWID by reading the next fields from the reader.
+    /// Creates an OWID by reading the fields from the reader. The reader
+    /// must hold exactly one OWID, because the payload length check in
+    /// [`io::Reader::read_payload`] requires the signature to be the end of
+    /// the buffer.
     pub(crate) fn from_reader(reader: &mut io::Reader<'_>) -> Result<Self> {
         let version = Version::try_from(reader.read_byte()?)?;
         if version == Version::Empty {
@@ -125,9 +135,9 @@ impl Owid {
         }
         Ok(Owid {
             version,
-            domain: reader.read_string()?,
+            domain: reader.read_domain()?,
             date: reader.read_date(version)?,
-            payload: reader.read_byte_array()?,
+            payload: reader.read_payload()?,
             signature: reader.read_signature()?,
         })
     }
@@ -137,9 +147,15 @@ impl Owid {
     /// # Errors
     ///
     /// Returns [`Error::InvalidSignatureLength`] if the OWID has not been
-    /// signed, or other errors if the fields can not be encoded.
+    /// signed, [`Error::DomainTooLong`] if the domain is longer than the
+    /// maximum a domain name may be, or other errors if the fields can not
+    /// be encoded.
     pub fn as_byte_array(&self) -> Result<Vec<u8>> {
+        let capacity = self.encoded_len(true)?;
         let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(capacity)
+            .map_err(|_| Error::ImplementationCapacityExceeded { required: capacity })?;
         self.to_buffer(&mut buffer)?;
         Ok(buffer)
     }
@@ -170,10 +186,12 @@ impl Owid {
     }
 
     /// Appends the fields other than the signature to the buffer. This is
-    /// the data over which the signature is calculated.
+    /// the data over which the signature is calculated, so a domain longer
+    /// than a domain name may be is refused here, before any signature is
+    /// computed over it.
     pub(crate) fn to_buffer_no_signature(&self, buffer: &mut Vec<u8>) -> Result<()> {
         io::write_byte(buffer, self.version.as_byte());
-        io::write_string(buffer, &self.domain)?;
+        io::write_domain(buffer, &self.domain)?;
         io::write_date(buffer, &self.date, self.version)?;
         io::write_byte_array(buffer, &self.payload)
     }
@@ -182,12 +200,58 @@ impl Owid {
     /// fields of this OWID without the signature, followed by the complete
     /// byte form of each of the others in the order provided.
     pub(crate) fn data_for_crypto(&self, others: &[&Owid]) -> Result<Vec<u8>> {
+        let mut capacity = self.encoded_len(false)?;
+        for other in others {
+            capacity = capacity.checked_add(other.encoded_len(true)?).ok_or(
+                Error::ImplementationCapacityExceeded {
+                    required: usize::MAX,
+                },
+            )?;
+        }
         let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(capacity)
+            .map_err(|_| Error::ImplementationCapacityExceeded { required: capacity })?;
         self.to_buffer_no_signature(&mut buffer)?;
         for other in others {
             other.to_buffer(&mut buffer)?;
         }
         Ok(buffer)
+    }
+
+    /// The exact number of bytes written for this OWID.
+    fn encoded_len(&self, include_signature: bool) -> Result<usize> {
+        if self.payload.len() > u32::MAX as usize {
+            return Err(Error::PayloadTooLarge(self.payload.len()));
+        }
+        if include_signature && self.signature.len() != crate::SIGNATURE_LENGTH {
+            return Err(Error::InvalidSignatureLength(self.signature.len()));
+        }
+        let date_len = match self.version {
+            Version::Version1 => 2,
+            Version::Version2 | Version::Version3 => 4,
+            other => return Err(Error::UnsupportedVersion(other.as_byte())),
+        };
+        let lengths = [
+            1,
+            self.domain.len(),
+            1,
+            date_len,
+            4,
+            self.payload.len(),
+            if include_signature {
+                crate::SIGNATURE_LENGTH
+            } else {
+                0
+            },
+        ];
+        lengths.into_iter().try_fold(0usize, |total, length| {
+            total
+                .checked_add(length)
+                .ok_or(Error::ImplementationCapacityExceeded {
+                    required: usize::MAX,
+                })
+        })
     }
 
     /// The payload interpreted as a string. Bytes that are not valid UTF-8

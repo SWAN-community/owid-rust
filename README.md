@@ -25,6 +25,40 @@ environments. Two optional features extend it.
 * `endpoints` adds framework agnostic helpers for hosting the well known end
   points that an OWID creator must serve.
 
+## Payload size and application limits
+
+The OWID wire format stores the payload length as an unsigned 32 bit value,
+so a payload from zero through 4,294,967,295 bytes is structurally valid. The
+format defines no smaller payload limit. The null terminated domain is capped
+at 253 characters, so that field is at most 254 bytes with its terminator,
+which leaves the payload as the only part of the envelope the protocol leaves
+open ended, so the protocol alone is not an application input limit for the
+complete envelope.
+
+This crate validates that the declared payload length agrees with the bytes
+present before it sizes or copies the payload. A large declaration without
+the corresponding bytes is malformed and is rejected without allocating the
+declared size. A matching large payload is not malformed merely because it is
+large, and parsing work and memory use scale with the bytes actually present.
+
+The 253 character domain maximum binds this crate on both sides. A buffer
+whose domain field runs past it is refused when it is read, and a domain
+longer than it is refused when a `Creator` is built and again when an OWID
+carrying it is serialized, so the crate will not emit an OWID that it would
+then refuse to read.
+
+The owned APIs remain subject to the target's `usize`, address-space and
+available-memory limits. Applications accepting untrusted OWIDs must choose
+limits suitable for their use case and enforce them before buffering the
+binary form or decoding Base64. An implementation capacity failure or an
+application policy rejection is distinct from an invalid OWID.
+
+For transport input, limit the complete HTTP body or encoded envelope; allow
+for the domain and other OWID fields as well as the payload. After parsing,
+`owid.payload.len()` reports the actual payload size without another copy and
+can be used for downstream policy. The parser cannot choose either limit on
+behalf of the application.
+
 ## Installation
 
 Add the crate to `Cargo.toml`.
@@ -144,6 +178,10 @@ as minutes since 2020-01-01 UTC in a little endian unsigned 32 bit integer
 and payload, then the 64 byte ECDSA P-256 signature over the SHA-256 digest
 of everything before it.
 
+* The domain is at most 253 characters. RFC 1035 section 2.3.4 restricts a
+  domain name to 255 octets in wire form, counting the length octet before
+  each label and the octet for the root, so the presentation form stored
+  here holds two characters fewer.
 * String payloads are encoded as UTF-8.
 * The deprecated version 1 date field stores a two byte big endian count of
   hours since the base date.
