@@ -60,7 +60,28 @@
 //! structure without the signature field, optionally followed by the
 //! complete byte form of other OWIDs covered by the signature, and signs it
 //! with the ECDSA NIST P-256 private key of the creator. The 64 byte
-//! signature completes the OWID, which is then immutable.
+//! signature completes the OWID, and creating and signing are one step, so
+//! an OWID that exists is always signed and never changes afterwards.
+//!
+//! ## How an OWID comes into being
+//!
+//! An OWID is only worth anything because it is signed, so this crate does
+//! not let one exist in an unsigned state. There are exactly two ways an
+//! instance reaches calling code.
+//!
+//! 1. [`Owid::from_base64`] or [`Owid::from_byte_array`] reads a complete
+//!    serialized OWID. Bytes that are not one are an ordinary outcome, so
+//!    the answer is a [`ParseError`] naming the reason with a
+//!    [`ParseStatus`], rather than anything exceptional.
+//! 2. [`Creator::create_string`] or [`Creator::create_bytes`] builds and
+//!    signs one in a single step, owning the version, the domain, the date
+//!    and the signature.
+//!
+//! Whether the bytes are an OWID and whether its signature is genuine are
+//! two questions with two answers. A successful read says nothing about the
+//! signature, and [`Owid::verify_status_with_public_key`] answers the
+//! second with a [`SignatureStatus`] that keeps a signature that does not
+//! match apart from a check that could not be made at all.
 //!
 //! ## Example
 //!
@@ -72,7 +93,7 @@
 //! let creator = Creator::new("example.com", crypto.clone()).unwrap();
 //!
 //! // Create and sign an OWID with a payload.
-//! let owid = creator.sign_string("Hello World").unwrap();
+//! let owid = creator.create_string("Hello World").unwrap();
 //!
 //! // Serialize to base 64 for storage or transmission.
 //! let encoded = owid.as_base64().unwrap();
@@ -100,6 +121,8 @@ mod crypto;
 mod error;
 mod io;
 mod owid;
+mod parse;
+mod status;
 mod version;
 
 #[cfg(feature = "endpoints")]
@@ -112,6 +135,8 @@ pub use creator::{Configuration, Creator};
 pub use crypto::Crypto;
 pub use error::{Error, Result};
 pub use owid::Owid;
+pub use parse::{ParseDetail, ParseError};
+pub use status::{ParseStatus, SignatureStatus};
 pub use version::Version;
 
 #[cfg(feature = "fetch")]
@@ -120,3 +145,11 @@ pub use fetch::public_key_url;
 /// The length of an OWID signature in bytes. The ECDSA P-256 signature is
 /// the 32 byte r value followed by the 32 byte s value.
 pub const SIGNATURE_LENGTH: usize = 64;
+
+/// The examples in the README are compiled and run as documentation tests
+/// with the features they need, so the documented way to use this crate can
+/// not quietly stop working. In another port the README example had already
+/// stopped compiling and nothing noticed.
+#[cfg(all(doctest, feature = "fetch", feature = "endpoints"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeExamples;

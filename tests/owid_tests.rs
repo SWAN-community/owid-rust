@@ -17,8 +17,7 @@
 //! Tests for [`Owid`] and [`Creator`]. Ports of the test suites in the .NET
 //! and Go implementations so that the behavior matches across languages.
 
-use chrono::Utc;
-use owid::{Creator, Crypto, Error, Owid, Version, SIGNATURE_LENGTH};
+use owid::{Creator, Crypto, Error, Owid, ParseStatus, SignatureStatus, SIGNATURE_LENGTH};
 
 const TEST_TEXT: &str = "Hello World";
 const TEST_DOMAIN: &str = "test.com";
@@ -57,15 +56,24 @@ impl Fixture {
     }
 
     fn create_owid(&self) -> Owid {
-        let mut owid = Owid {
-            payload: TEST_TEXT.as_bytes().to_vec(),
-            ..Owid::default()
-        };
         self.creator()
-            .sign(&mut owid)
-            .expect("should sign the OWID");
-        owid
+            .create_string(TEST_TEXT)
+            .expect("should create the OWID")
     }
+}
+
+/// Tampering reaches a verifier as bytes, so a test that wants a changed
+/// OWID changes the serialized form and reads it back. The fields of an
+/// OWID cannot be changed in memory, which is the point of them being read
+/// only, so this is the only way to hold one whose signature no longer
+/// describes it.
+fn tampered(owid: &Owid, index: usize) -> Owid {
+    let mut bytes = owid.as_byte_array().expect("should serialize");
+    // The low bit only, so a letter in the domain stays a letter and the
+    // envelope still parses. What is being tested is that a changed field
+    // fails verification, not that a broken envelope fails to parse.
+    bytes[index] ^= 0x01;
+    Owid::from_byte_array(&bytes).expect("should still parse")
 }
 
 /// Port of the .NET TestCreate test. Creation, verification, and base 64
@@ -92,9 +100,10 @@ fn create() {
 #[test]
 fn verification_fails_with_invalid_signature() {
     let fixture = Fixture::new();
-    let mut owid = fixture.create_owid();
-
-    owid.signature[0] ^= 0xFF;
+    let signed = fixture.create_owid();
+    let length = signed.as_byte_array().expect("should serialize").len();
+    // The signature is the last SIGNATURE_LENGTH bytes of the envelope.
+    let owid = tampered(&signed, length - SIGNATURE_LENGTH);
 
     let valid = owid
         .verify_with_crypto(&fixture.verifier(), &[])
@@ -119,14 +128,10 @@ fn verification_fails_with_wrong_public_key() {
 #[test]
 fn create_with_empty_payload() {
     let fixture = Fixture::new();
-    let mut owid = Owid {
-        payload: Vec::new(),
-        ..Owid::default()
-    };
-    fixture
+    let owid = fixture
         .creator()
-        .sign(&mut owid)
-        .expect("should sign the OWID");
+        .create_bytes(Vec::new())
+        .expect("should create the OWID");
 
     let valid = owid
         .verify_with_crypto(&fixture.verifier(), &[])
@@ -142,14 +147,10 @@ fn create_with_large_payload() {
     let large_payload: Vec<u8> = (0..10_000u32)
         .map(|i| (i.wrapping_mul(31).wrapping_add(7) % 256) as u8)
         .collect();
-    let mut owid = Owid {
-        payload: large_payload.clone(),
-        ..Owid::default()
-    };
-    fixture
+    let owid = fixture
         .creator()
-        .sign(&mut owid)
-        .expect("should sign the OWID");
+        .create_bytes(large_payload.clone())
+        .expect("should create the OWID");
 
     let valid = owid
         .verify_with_crypto(&fixture.verifier(), &[])
@@ -157,17 +158,17 @@ fn create_with_large_payload() {
     assert!(valid, "OWID with large payload should verify");
 
     let copy = Owid::from_base64(&owid.as_base64().expect("should encode")).expect("should decode");
-    assert_eq!(copy.payload, large_payload, "payload should round trip");
+    assert_eq!(copy.payload(), large_payload, "payload should round trip");
 }
 
 /// Port of the .NET TestCreatorSignWithStringPayload test.
 #[test]
-fn creator_sign_with_string_payload() {
+fn creator_create_with_string_payload() {
     let fixture = Fixture::new();
     let owid = fixture
         .creator()
-        .sign_string(TEST_TEXT)
-        .expect("should sign the string");
+        .create_string(TEST_TEXT)
+        .expect("should create from the string");
 
     assert_eq!(
         owid.payload_as_string(),
@@ -183,15 +184,15 @@ fn creator_sign_with_string_payload() {
 
 /// Port of the .NET TestCreatorSignWithBytePayload test.
 #[test]
-fn creator_sign_with_byte_payload() {
+fn creator_create_with_byte_payload() {
     let fixture = Fixture::new();
     let payload = TEST_TEXT.as_bytes().to_vec();
     let owid = fixture
         .creator()
-        .sign_bytes(payload.clone())
-        .expect("should sign the bytes");
+        .create_bytes(payload.clone())
+        .expect("should create from the bytes");
 
-    assert_eq!(owid.payload, payload, "payload bytes should match");
+    assert_eq!(owid.payload(), payload, "payload bytes should match");
 
     let valid = owid
         .verify_with_crypto(&fixture.verifier(), &[])
@@ -199,21 +200,17 @@ fn creator_sign_with_byte_payload() {
     assert!(valid, "OWID should verify");
 }
 
-/// Port of the .NET TestCreatorSetsDomain test.
+/// Port of the .NET TestCreatorSetsDomain test. The creator owns the
+/// domain, so a caller has no way to ask for a different one.
 #[test]
 fn creator_sets_domain() {
     let fixture = Fixture::new();
-    let mut owid = Owid {
-        domain: "other.com".to_owned(),
-        payload: TEST_TEXT.as_bytes().to_vec(),
-        ..Owid::default()
-    };
-    fixture
+    let owid = fixture
         .creator()
-        .sign(&mut owid)
-        .expect("should sign the OWID");
+        .create_string(TEST_TEXT)
+        .expect("should create the OWID");
 
-    assert_eq!(owid.domain, TEST_DOMAIN, "creator should set the domain");
+    assert_eq!(owid.domain(), TEST_DOMAIN, "creator should set the domain");
 }
 
 /// Port of the .NET TestSerializationRoundtrip test. Multiple encode and
@@ -241,9 +238,10 @@ fn serialization_roundtrip() {
 #[test]
 fn invalid_base64_errors() {
     let result = Owid::from_base64("This is not valid Base64!@#$");
-    assert!(
-        matches!(result, Err(Error::Base64(_))),
-        "invalid base 64 should error"
+    assert_eq!(
+        ParseStatus::of(&result),
+        ParseStatus::InvalidBase64,
+        "invalid base 64 should report the reason"
     );
 }
 
@@ -257,8 +255,8 @@ fn batch_signing_and_verification() {
     let owids: Vec<Owid> = (0..BATCH_SIZE)
         .map(|i| {
             creator
-                .sign_bytes(format!("Payload {i}").into_bytes())
-                .expect("should sign the payload")
+                .create_bytes(format!("Payload {i}").into_bytes())
+                .expect("should create from the payload")
         })
         .collect();
 
@@ -275,9 +273,14 @@ fn batch_signing_and_verification() {
 #[test]
 fn modified_domain_fails_verification() {
     let fixture = Fixture::new();
-    let mut owid = fixture.create_owid();
-
-    owid.domain = "different.com".to_owned();
+    // Byte 1 is the first character of the domain, which follows the
+    // version byte.
+    let owid = tampered(&fixture.create_owid(), 1);
+    assert_ne!(
+        owid.domain(),
+        TEST_DOMAIN,
+        "the tampered copy should carry a different domain"
+    );
 
     let valid = owid
         .verify_with_crypto(&fixture.verifier(), &[])
@@ -307,13 +310,17 @@ fn base64_roundtrip_compare() {
     let copy =
         Owid::from_base64(&original.as_base64().expect("should encode")).expect("should decode");
 
-    assert_eq!(copy.version, original.version, "version should match");
-    assert_eq!(copy.domain, original.domain, "domain should match");
-    assert_eq!(copy.payload, original.payload, "payload should match");
-    assert_eq!(copy.signature, original.signature, "signature should match");
+    assert_eq!(copy.version(), original.version(), "version should match");
+    assert_eq!(copy.domain(), original.domain(), "domain should match");
+    assert_eq!(copy.payload(), original.payload(), "payload should match");
     assert_eq!(
-        copy.date.timestamp() / 60,
-        original.date.timestamp() / 60,
+        copy.signature(),
+        original.signature(),
+        "signature should match"
+    );
+    assert_eq!(
+        copy.date().timestamp() / 60,
+        original.date().timestamp() / 60,
         "date should match to the minute"
     );
 }
@@ -382,13 +389,9 @@ fn sign_and_verify_with_others() {
     let processor_crypto = Crypto::new();
     let processor = Creator::new("processor.com", processor_crypto.clone())
         .expect("should create the processor creator");
-    let mut response = Owid {
-        payload: b"response".to_vec(),
-        ..Owid::default()
-    };
-    processor
-        .sign_with_others(&mut response, &[&root])
-        .expect("should sign with others");
+    let response = processor
+        .create_bytes_with_others(b"response".to_vec(), &[&root])
+        .expect("should create with others");
 
     let valid = response
         .verify_with_crypto(&processor_crypto, &[&root])
@@ -405,8 +408,8 @@ fn sign_and_verify_with_others() {
     // produce an identical OWID.
     let other_root = root_fixture
         .creator()
-        .sign_bytes(b"different root".to_vec())
-        .expect("should sign the other root");
+        .create_bytes(b"different root".to_vec())
+        .expect("should create the other root");
     let valid = response
         .verify_with_crypto(&processor_crypto, &[&other_root])
         .expect("should run verification with different others");
@@ -424,35 +427,30 @@ fn empty_domain_rejected() {
     );
 }
 
-/// An unsigned OWID can not be serialized because the signature is not the
-/// required length.
+/// The empty marker is a single zero byte saying that an optional OWID is
+/// not present, mirroring the EmptyToBuffer functions in the .NET and Go
+/// implementations. A marker is not an OWID, so reading one as a complete
+/// envelope is refused rather than handing back an OWID with nothing in it.
 #[test]
-fn unsigned_owid_cannot_serialize() {
-    let owid = Owid::new(TEST_DOMAIN, Utc::now(), b"data".to_vec());
-    let result = owid.as_byte_array();
-    assert!(
-        matches!(result, Err(Error::InvalidSignatureLength(0))),
-        "unsigned OWID should not serialize"
-    );
-}
-
-/// The empty marker byte round trips as an empty OWID, mirroring the
-/// EmptyToBuffer functions in the .NET and Go implementations.
-#[test]
-fn empty_marker_roundtrip() {
+fn empty_marker_is_not_an_owid() {
     let mut buffer = Vec::new();
     Owid::empty_to_buffer(&mut buffer);
     assert_eq!(buffer, vec![0], "empty marker should be a single zero byte");
-    let owid = Owid::from_byte_array(&buffer).expect("should parse the marker");
-    assert_eq!(owid.version, Version::Empty, "version should be empty");
+    let result = Owid::from_byte_array(&buffer);
+    assert_eq!(
+        ParseStatus::of(&result),
+        ParseStatus::UnsupportedVersion,
+        "a marker should not read as an OWID"
+    );
 }
 
 /// Unknown version bytes are rejected.
 #[test]
 fn unknown_version_rejected() {
     let result = Owid::from_byte_array(&[9]);
-    assert!(
-        matches!(result, Err(Error::UnsupportedVersion(9))),
+    assert_eq!(
+        ParseStatus::of(&result),
+        ParseStatus::UnsupportedVersion,
         "unknown version should be rejected"
     );
 }
@@ -467,14 +465,27 @@ fn signature_length_constant() {
 #[test]
 fn modified_payload_fails_verification() {
     let fixture = Fixture::new();
-    let mut owid = fixture.create_owid();
-
-    owid.payload[0] ^= 0xFF;
+    let signed = fixture.create_owid();
+    // The payload follows the version byte, the domain and its terminator,
+    // the four date bytes and the four length bytes.
+    let index = 1 + TEST_DOMAIN.len() + 1 + 4 + 4;
+    let owid = tampered(&signed, index);
+    assert_ne!(
+        owid.payload(),
+        signed.payload(),
+        "the tampered copy should carry a different payload"
+    );
 
     let valid = owid
         .verify_with_crypto(&fixture.verifier(), &[])
         .expect("should run verification");
     assert!(!valid, "modified payload should fail verification");
+    assert_eq!(
+        owid.verify_status_with_crypto(&fixture.verifier(), &[]),
+        SignatureStatus::Invalid,
+        "a signature that does not match is the one status meaning the \
+         identifier should be distrusted"
+    );
 }
 
 /// Non ASCII payloads survive the string APIs because Rust uses UTF-8, the
@@ -486,8 +497,8 @@ fn non_ascii_payload_roundtrip() {
     let text = "h\u{e9}llo w\u{f6}rld \u{20ac}100";
     let owid = fixture
         .creator()
-        .sign_string(text)
-        .expect("should sign the string");
+        .create_string(text)
+        .expect("should create from the string");
 
     let copy = Owid::from_base64(&owid.as_base64().expect("should encode")).expect("should decode");
     assert_eq!(
@@ -522,43 +533,15 @@ fn date_precision_to_the_minute() {
 
     let copy = Owid::from_base64(&owid.as_base64().expect("should encode")).expect("should decode");
     assert_eq!(
-        copy.date.timestamp() % 60,
+        copy.date().timestamp() % 60,
         0,
         "decoded date should have no seconds component"
     );
     assert_eq!(
-        copy.date.timestamp() / 60,
-        owid.date.timestamp() / 60,
+        copy.date().timestamp() / 60,
+        owid.date().timestamp() / 60,
         "decoded date should be the original floored to the minute"
     );
-}
-
-/// Port of the .NET and Go version 1 and 2 round trip tests. Earlier
-/// versions can still be signed, serialized, read, and verified.
-#[test]
-fn version_1_and_2_roundtrip() {
-    let fixture = Fixture::new();
-    for version in [Version::Version1, Version::Version2] {
-        let mut owid = Owid {
-            version,
-            payload: TEST_TEXT.as_bytes().to_vec(),
-            ..Owid::default()
-        };
-        fixture
-            .creator()
-            .sign(&mut owid)
-            .expect("should sign the OWID");
-
-        let copy =
-            Owid::from_base64(&owid.as_base64().expect("should encode")).expect("should decode");
-        assert_eq!(copy.version, version, "version should round trip");
-        assert_eq!(copy.domain, owid.domain, "domain should round trip");
-        assert_eq!(copy.payload, owid.payload, "payload should round trip");
-        assert_eq!(
-            copy.signature, owid.signature,
-            "signature should round trip"
-        );
-    }
 }
 
 /// Port of the Go TestCreatorBatch uniqueness assertion. Different payloads
@@ -570,8 +553,8 @@ fn batch_owids_unique() {
     let mut encoded: Vec<String> = (0..10)
         .map(|i| {
             creator
-                .sign_bytes(format!("payload {i}").into_bytes())
-                .expect("should sign the payload")
+                .create_bytes(format!("payload {i}").into_bytes())
+                .expect("should create from the payload")
                 .as_base64()
                 .expect("should encode")
         })
@@ -602,15 +585,4 @@ fn signature_alignment() {
             .expect("should verify the data");
         assert!(valid, "signature {i} should verify");
     }
-}
-
-/// Port of the Go TestCreatorCreateOWID test. A new OWID is unsigned until
-/// the creator signs it.
-#[test]
-fn new_owid_unsigned() {
-    let owid = Owid::new(TEST_DOMAIN, Utc::now(), TEST_TEXT.as_bytes().to_vec());
-    assert_eq!(owid.version, Version::Version3, "version should be current");
-    assert_eq!(owid.domain, TEST_DOMAIN, "domain should match");
-    assert_eq!(owid.payload, TEST_TEXT.as_bytes(), "payload should match");
-    assert!(owid.signature.is_empty(), "signature should be empty");
 }

@@ -66,17 +66,17 @@ fn fixture_date() -> DateTime<Utc> {
 #[test]
 fn creator_fixture_fields() {
     let owid = Owid::from_base64(TEST_CREATOR_OWID).expect("should parse the creator fixture");
-    assert_eq!(owid.version, Version::Version2, "version should be 2");
-    assert_eq!(owid.domain, "51db.uk", "domain should match");
+    assert_eq!(owid.version(), Version::Version2, "version should be 2");
+    assert_eq!(owid.domain(), "51db.uk", "domain should match");
     assert_eq!(
-        owid.date,
+        owid.date(),
         fixture_date(),
         "date should be 2021-04-06 12:59Z"
     );
-    assert_eq!(owid.payload.len(), 341, "payload should be 341 bytes");
-    assert_eq!(owid.signature.len(), 64, "signature should be 64 bytes");
-    assert_eq!(owid.signature[0], 74, "first signature byte should match");
-    assert_eq!(owid.signature[63], 64, "last signature byte should match");
+    assert_eq!(owid.payload().len(), 341, "payload should be 341 bytes");
+    assert_eq!(owid.signature().len(), 64, "signature should be 64 bytes");
+    assert_eq!(owid.signature()[0], 74, "first signature byte should match");
+    assert_eq!(owid.signature()[63], 64, "last signature byte should match");
 }
 
 /// The supplier fixture decodes to the expected field values, including the
@@ -84,15 +84,15 @@ fn creator_fixture_fields() {
 #[test]
 fn supplier_fixture_fields() {
     let owid = Owid::from_base64(TEST_SUPPLIER_OWID).expect("should parse the supplier fixture");
-    assert_eq!(owid.version, Version::Version2, "version should be 2");
-    assert_eq!(owid.domain, "pop-up.swan-demo.uk", "domain should match");
+    assert_eq!(owid.version(), Version::Version2, "version should be 2");
+    assert_eq!(owid.domain(), "pop-up.swan-demo.uk", "domain should match");
     assert_eq!(
-        owid.date,
+        owid.date(),
         fixture_date(),
         "date should be 2021-04-06 12:59Z"
     );
     assert_eq!(
-        owid.payload,
+        owid.payload(),
         vec![0x01, 0x03],
         "payload should be 0x01 0x03"
     );
@@ -106,7 +106,7 @@ fn supplier_fixture_fields() {
         "0103",
         "payload as printable should be zero padded hexadecimal"
     );
-    assert_eq!(owid.signature.len(), 64, "signature should be 64 bytes");
+    assert_eq!(owid.signature().len(), 64, "signature should be 64 bytes");
 }
 
 /// The bad actor fixture still parses. Verification failure is a crypto
@@ -114,9 +114,9 @@ fn supplier_fixture_fields() {
 #[test]
 fn bad_fixture_parses() {
     let owid = Owid::from_base64(TEST_BAD_OWID).expect("should parse the bad fixture");
-    assert_eq!(owid.domain, "badssp.swan-demo.uk", "domain should match");
+    assert_eq!(owid.domain(), "badssp.swan-demo.uk", "domain should match");
     assert_eq!(
-        owid.payload,
+        owid.payload(),
         vec![0x01, 0x03],
         "payload should be 0x01 0x03"
     );
@@ -161,22 +161,20 @@ fn data_for_crypto_layout() {
     );
 }
 
-/// Builds the same byte sequence that verification uses by serializing the
+/// Builds the same byte sequence that verification uses by writing the
 /// supplier without its signature followed by the complete creator.
 fn supplier_verification_data(supplier: &Owid, creator: &Owid) -> Vec<u8> {
-    let mut unsigned = supplier.clone();
-    unsigned.signature = Vec::new();
-    // Serialize the unsigned form by removing the empty signature error
-    // path. The public API serializes complete OWIDs only, so rebuild from
+    // The public API serializes complete OWIDs only, and an OWID cannot be
+    // held without its signature, so the unsigned form is rebuilt here from
     // the parts in wire order.
     let mut data = Vec::new();
-    data.push(unsigned.version.as_byte());
-    data.extend_from_slice(unsigned.domain.as_bytes());
+    data.push(supplier.version().as_byte());
+    data.extend_from_slice(supplier.domain().as_bytes());
     data.push(0);
-    let minutes = (unsigned.date - base_date()).num_minutes() as u32;
+    let minutes = (supplier.date() - base_date()).num_minutes() as u32;
     data.extend_from_slice(&minutes.to_le_bytes());
-    data.extend_from_slice(&(unsigned.payload.len() as u32).to_le_bytes());
-    data.extend_from_slice(&unsigned.payload);
+    data.extend_from_slice(&(supplier.payload().len() as u32).to_le_bytes());
+    data.extend_from_slice(supplier.payload());
     data.extend_from_slice(
         &creator
             .as_byte_array()
@@ -207,9 +205,9 @@ fn version_1_date_read_from_buffer() {
     buffer.extend_from_slice(&[0u8; 64]);
 
     let owid = Owid::from_byte_array(&buffer).expect("should parse version 1");
-    assert_eq!(owid.version, Version::Version1, "version should be 1");
+    assert_eq!(owid.version(), Version::Version1, "version should be 1");
     assert_eq!(
-        owid.date,
+        owid.date(),
         base_date() + Duration::hours(9460),
         "date should be the base date plus 9460 hours"
     );
@@ -229,6 +227,6 @@ fn version_2_date_read_from_buffer() {
     buffer.extend_from_slice(&[0u8; 64]);
 
     let owid = Owid::from_byte_array(&buffer).expect("should parse version 2");
-    assert_eq!(owid.version, Version::Version2, "version should be 2");
-    assert_eq!(owid.date, fixture_date(), "date should match the minutes");
+    assert_eq!(owid.version(), Version::Version2, "version should be 2");
+    assert_eq!(owid.date(), fixture_date(), "date should match the minutes");
 }

@@ -20,6 +20,7 @@ use crate::crypto::Crypto;
 use crate::error::{Error, Result};
 use crate::io::MAXIMUM_DOMAIN_LENGTH;
 use crate::owid::Owid;
+use crate::version::Version;
 
 /// Configuration for a [`Creator`] where the domain and keys come from
 /// settings rather than code.
@@ -62,8 +63,8 @@ impl Creator {
     /// use owid::{Creator, Crypto};
     ///
     /// let creator = Creator::new("example.com", Crypto::new()).unwrap();
-    /// let owid = creator.sign_string("Hello World").unwrap();
-    /// assert_eq!("example.com", owid.domain);
+    /// let owid = creator.create_string("Hello World").unwrap();
+    /// assert_eq!("example.com", owid.domain());
     /// ```
     pub fn new(domain: &str, crypto: Crypto) -> Result<Self> {
         if domain.trim().is_empty() {
@@ -112,57 +113,90 @@ impl Creator {
         &self.crypto
     }
 
-    /// Signs the OWID provided, setting the domain to the creator domain and
-    /// the date to the current time.
+    /// Creates and signs an OWID carrying the string as its payload.
+    ///
+    /// This and its byte forms are the only way to make an OWID, the other
+    /// route to one being a successful parse. The creator owns the version,
+    /// the domain, the date and the signature, and a caller supplies the
+    /// payload, so there is no moment at which a partly built OWID exists
+    /// for anyone to hold or pass on.
     ///
     /// # Errors
     ///
     /// Returns errors if the fields can not be encoded or the signing
     /// operation fails.
-    pub fn sign(&self, owid: &mut Owid) -> Result<()> {
-        self.sign_with_others(owid, &[])
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use owid::{Creator, Crypto};
+    ///
+    /// let creator = Creator::new("example.com", Crypto::new()).unwrap();
+    /// let owid = creator.create_string("Hello World").unwrap();
+    /// assert_eq!(owid.payload_as_string(), "Hello World");
+    /// assert_eq!(owid.signature().len(), owid::SIGNATURE_LENGTH);
+    /// ```
+    ///
+    /// There is no public way to sign an OWID that already exists, because
+    /// re-signing one would replace a signature its fields were read with.
+    ///
+    /// ```compile_fail
+    /// use owid::{Creator, Crypto};
+    ///
+    /// let creator = Creator::new("example.com", Crypto::new()).unwrap();
+    /// let mut owid = creator.create_string("Hello World").unwrap();
+    ///
+    /// creator.sign(&mut owid).unwrap();
+    /// ```
+    pub fn create_string(&self, value: &str) -> Result<Owid> {
+        self.create_bytes(value.as_bytes().to_vec())
     }
 
-    /// Signs the OWID provided together with the other OWIDs provided. The
-    /// same others, in the same order, must be passed when verifying.
+    /// Creates and signs an OWID carrying the bytes as its payload.
     ///
     /// # Errors
     ///
-    /// Returns errors if the fields can not be encoded or the signing
-    /// operation fails.
-    pub fn sign_with_others(&self, owid: &mut Owid, others: &[&Owid]) -> Result<()> {
-        owid.domain = self.domain.clone();
-        owid.date = Utc::now();
+    /// See [`Creator::create_string`].
+    pub fn create_bytes(&self, value: Vec<u8>) -> Result<Owid> {
+        self.create_bytes_with_others(value, &[])
+    }
+
+    /// Creates and signs an OWID carrying the bytes as its payload, with
+    /// the signature covering the other OWIDs as well, as a processor does
+    /// when adding itself to a transaction. The same others, in the same
+    /// order, must be passed when verifying.
+    ///
+    /// # Errors
+    ///
+    /// See [`Creator::create_string`].
+    pub fn create_bytes_with_others(&self, value: Vec<u8>, others: &[&Owid]) -> Result<Owid> {
+        self.create_version(Version::default(), value, others)
+    }
+
+    /// Creates and signs an OWID of the version given.
+    ///
+    /// Crate private because versions 1 and 2 are deprecated and readable
+    /// for existing data only, so nothing outside should be making one. The
+    /// public creation methods all arrive here with the current version.
+    pub(crate) fn create_version(
+        &self,
+        version: Version,
+        payload: Vec<u8>,
+        others: &[&Owid],
+    ) -> Result<Owid> {
+        let mut owid = Owid::from_parts(
+            version,
+            self.domain.clone(),
+            Utc::now(),
+            payload,
+            Vec::new(),
+        );
         let data = owid.data_for_crypto(others)?;
-        owid.signature = self.crypto.sign_byte_array(&data)?;
-        if owid.signature.len() != crate::SIGNATURE_LENGTH {
-            return Err(Error::InvalidSignatureLength(owid.signature.len()));
+        let signature = self.crypto.sign_byte_array(&data)?;
+        if signature.len() != crate::SIGNATURE_LENGTH {
+            return Err(Error::InvalidSignatureLength(signature.len()));
         }
-        Ok(())
-    }
-
-    /// Creates a new signed OWID for the creator containing the string as
-    /// the payload.
-    ///
-    /// # Errors
-    ///
-    /// See [`Creator::sign`].
-    pub fn sign_string(&self, value: &str) -> Result<Owid> {
-        self.sign_bytes(value.as_bytes().to_vec())
-    }
-
-    /// Creates a new signed OWID for the creator containing the bytes as the
-    /// payload.
-    ///
-    /// # Errors
-    ///
-    /// See [`Creator::sign`].
-    pub fn sign_bytes(&self, value: Vec<u8>) -> Result<Owid> {
-        let mut owid = Owid {
-            payload: value,
-            ..Owid::default()
-        };
-        self.sign(&mut owid)?;
+        owid.set_signature(signature);
         Ok(owid)
     }
 }
@@ -200,11 +234,46 @@ mod tests {
     fn domain_of_maximum_length_is_accepted() {
         let domain = domain_of_length(MAXIMUM_DOMAIN_LENGTH);
         let creator = Creator::new(&domain, Crypto::new()).expect("should create the creator");
-        let owid = creator.sign_string("Hello World").expect("should sign");
+        let owid = creator.create_string("Hello World").expect("should create");
         let bytes = owid.as_byte_array().expect("should serialize");
         let parsed = Owid::from_byte_array(&bytes).expect("should parse back");
-        assert_eq!(parsed.domain, domain, "domain should round trip");
-        assert_eq!(parsed.payload, owid.payload, "payload should round trip");
+        assert_eq!(parsed.domain(), domain, "domain should round trip");
+        assert_eq!(
+            parsed.payload(),
+            owid.payload(),
+            "payload should round trip"
+        );
+    }
+
+    /// The deprecated versions can still be written and read, which the
+    /// crate needs for data created by earlier implementations. Creating
+    /// one is crate private, so this test lives here rather than with the
+    /// tests outside the crate, and it is the round trip that matters
+    /// rather than the way the OWID was made.
+    #[test]
+    fn deprecated_versions_round_trip() {
+        let crypto = Crypto::new();
+        let creator = Creator::new("test.com", crypto.clone()).expect("should create the creator");
+        for version in [Version::Version1, Version::Version2] {
+            let owid = creator
+                .create_version(version, b"Hello World".to_vec(), &[])
+                .expect("should create");
+            let encoded = owid.as_base64().expect("should encode");
+            let copy = Owid::from_base64(&encoded).expect("should decode");
+            assert_eq!(copy.version(), version, "version should round trip");
+            assert_eq!(copy.domain(), owid.domain(), "domain should round trip");
+            assert_eq!(copy.payload(), owid.payload(), "payload should round trip");
+            assert_eq!(
+                copy.signature(),
+                owid.signature(),
+                "signature should round trip"
+            );
+            assert!(
+                copy.verify_with_crypto(&crypto, &[])
+                    .expect("should verify"),
+                "a deprecated version should still verify"
+            );
+        }
     }
 
     /// One character more than the maximum is refused where the domain is
