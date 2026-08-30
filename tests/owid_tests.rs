@@ -57,7 +57,7 @@ impl Fixture {
 
     fn create_owid(&self) -> Owid {
         self.creator()
-            .create_string(TEST_TEXT)
+            .create(TEST_TEXT)
             .expect("should create the OWID")
     }
 }
@@ -130,7 +130,7 @@ fn create_with_empty_payload() {
     let fixture = Fixture::new();
     let owid = fixture
         .creator()
-        .create_bytes(Vec::new())
+        .create(Vec::new())
         .expect("should create the OWID");
 
     let valid = owid
@@ -149,7 +149,7 @@ fn create_with_large_payload() {
         .collect();
     let owid = fixture
         .creator()
-        .create_bytes(large_payload.clone())
+        .create(large_payload.clone())
         .expect("should create the OWID");
 
     let valid = owid
@@ -167,7 +167,7 @@ fn creator_create_with_string_payload() {
     let fixture = Fixture::new();
     let owid = fixture
         .creator()
-        .create_string(TEST_TEXT)
+        .create(TEST_TEXT)
         .expect("should create from the string");
 
     assert_eq!(
@@ -189,7 +189,7 @@ fn creator_create_with_byte_payload() {
     let payload = TEST_TEXT.as_bytes().to_vec();
     let owid = fixture
         .creator()
-        .create_bytes(payload.clone())
+        .create(payload.clone())
         .expect("should create from the bytes");
 
     assert_eq!(owid.payload(), payload, "payload bytes should match");
@@ -207,7 +207,7 @@ fn creator_sets_domain() {
     let fixture = Fixture::new();
     let owid = fixture
         .creator()
-        .create_string(TEST_TEXT)
+        .create(TEST_TEXT)
         .expect("should create the OWID");
 
     assert_eq!(owid.domain(), TEST_DOMAIN, "creator should set the domain");
@@ -255,7 +255,7 @@ fn batch_signing_and_verification() {
     let owids: Vec<Owid> = (0..BATCH_SIZE)
         .map(|i| {
             creator
-                .create_bytes(format!("Payload {i}").into_bytes())
+                .create(format!("Payload {i}").into_bytes())
                 .expect("should create from the payload")
         })
         .collect();
@@ -390,7 +390,7 @@ fn sign_and_verify_with_others() {
     let processor = Creator::new("processor.com", processor_crypto.clone())
         .expect("should create the processor creator");
     let response = processor
-        .create_bytes_with_others(b"response".to_vec(), &[&root])
+        .create_with_others(b"response".to_vec(), &[&root])
         .expect("should create with others");
 
     let valid = response
@@ -408,7 +408,7 @@ fn sign_and_verify_with_others() {
     // produce an identical OWID.
     let other_root = root_fixture
         .creator()
-        .create_bytes(b"different root".to_vec())
+        .create(b"different root".to_vec())
         .expect("should create the other root");
     let valid = response
         .verify_with_crypto(&processor_crypto, &[&other_root])
@@ -497,7 +497,7 @@ fn non_ascii_payload_roundtrip() {
     let text = "h\u{e9}llo w\u{f6}rld \u{20ac}100";
     let owid = fixture
         .creator()
-        .create_string(text)
+        .create(text)
         .expect("should create from the string");
 
     let copy = Owid::from_base64(&owid.as_base64().expect("should encode")).expect("should decode");
@@ -553,7 +553,7 @@ fn batch_owids_unique() {
     let mut encoded: Vec<String> = (0..10)
         .map(|i| {
             creator
-                .create_bytes(format!("payload {i}").into_bytes())
+                .create(format!("payload {i}").into_bytes())
                 .expect("should create from the payload")
                 .as_base64()
                 .expect("should encode")

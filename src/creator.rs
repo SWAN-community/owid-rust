@@ -63,7 +63,7 @@ impl Creator {
     /// use owid::{Creator, Crypto};
     ///
     /// let creator = Creator::new("example.com", Crypto::new()).unwrap();
-    /// let owid = creator.create_string("Hello World").unwrap();
+    /// let owid = creator.create("Hello World").unwrap();
     /// assert_eq!("example.com", owid.domain());
     /// ```
     pub fn new(domain: &str, crypto: Crypto) -> Result<Self> {
@@ -113,13 +113,14 @@ impl Creator {
         &self.crypto
     }
 
-    /// Creates and signs an OWID carrying the string as its payload.
+    /// Creates and signs an OWID carrying the payload given, which may be
+    /// anything that becomes bytes, such as a string or a byte vector.
     ///
-    /// This and its byte forms are the only way to make an OWID, the other
-    /// route to one being a successful parse. The creator owns the version,
-    /// the domain, the date and the signature, and a caller supplies the
-    /// payload, so there is no moment at which a partly built OWID exists
-    /// for anyone to hold or pass on.
+    /// This is the only way to make an OWID, the other route to one being a
+    /// successful read. The creator owns the version, the domain, the date
+    /// and the signature, and a caller supplies the payload, so there is no
+    /// moment at which a partly built OWID exists for anyone to hold or
+    /// pass on.
     ///
     /// # Errors
     ///
@@ -132,9 +133,13 @@ impl Creator {
     /// use owid::{Creator, Crypto};
     ///
     /// let creator = Creator::new("example.com", Crypto::new()).unwrap();
-    /// let owid = creator.create_string("Hello World").unwrap();
-    /// assert_eq!(owid.payload_as_string(), "Hello World");
-    /// assert_eq!(owid.signature().len(), owid::SIGNATURE_LENGTH);
+    ///
+    /// let from_text = creator.create("Hello World").unwrap();
+    /// let from_bytes = creator.create(vec![0x01, 0x03]).unwrap();
+    ///
+    /// assert_eq!(from_text.payload_as_string(), "Hello World");
+    /// assert_eq!(from_bytes.payload(), [0x01, 0x03]);
+    /// assert_eq!(from_text.signature().len(), owid::SIGNATURE_LENGTH);
     /// ```
     ///
     /// There is no public way to sign an OWID that already exists, because
@@ -144,40 +149,34 @@ impl Creator {
     /// use owid::{Creator, Crypto};
     ///
     /// let creator = Creator::new("example.com", Crypto::new()).unwrap();
-    /// let mut owid = creator.create_string("Hello World").unwrap();
+    /// let mut owid = creator.create("Hello World").unwrap();
     ///
     /// creator.sign(&mut owid).unwrap();
     /// ```
-    pub fn create_string(&self, value: &str) -> Result<Owid> {
-        self.create_bytes(value.as_bytes().to_vec())
+    pub fn create(&self, payload: impl Into<Vec<u8>>) -> Result<Owid> {
+        self.create_with_others(payload, &[])
     }
 
-    /// Creates and signs an OWID carrying the bytes as its payload.
+    /// Creates and signs an OWID whose signature covers the other OWIDs as
+    /// well, as a processor does when adding itself to a transaction. The
+    /// same others, in the same order, must be passed when verifying.
     ///
     /// # Errors
     ///
-    /// See [`Creator::create_string`].
-    pub fn create_bytes(&self, value: Vec<u8>) -> Result<Owid> {
-        self.create_bytes_with_others(value, &[])
-    }
-
-    /// Creates and signs an OWID carrying the bytes as its payload, with
-    /// the signature covering the other OWIDs as well, as a processor does
-    /// when adding itself to a transaction. The same others, in the same
-    /// order, must be passed when verifying.
-    ///
-    /// # Errors
-    ///
-    /// See [`Creator::create_string`].
-    pub fn create_bytes_with_others(&self, value: Vec<u8>, others: &[&Owid]) -> Result<Owid> {
-        self.create_version(Version::default(), value, others)
+    /// See [`Creator::create`].
+    pub fn create_with_others(
+        &self,
+        payload: impl Into<Vec<u8>>,
+        others: &[&Owid],
+    ) -> Result<Owid> {
+        self.create_version(Version::default(), payload.into(), others)
     }
 
     /// Creates and signs an OWID of the version given.
     ///
     /// Crate private because versions 1 and 2 are deprecated and readable
     /// for existing data only, so nothing outside should be making one. The
-    /// public creation methods all arrive here with the current version.
+    /// public creation methods arrive here with the current version.
     pub(crate) fn create_version(
         &self,
         version: Version,
@@ -234,7 +233,7 @@ mod tests {
     fn domain_of_maximum_length_is_accepted() {
         let domain = domain_of_length(MAXIMUM_DOMAIN_LENGTH);
         let creator = Creator::new(&domain, Crypto::new()).expect("should create the creator");
-        let owid = creator.create_string("Hello World").expect("should create");
+        let owid = creator.create("Hello World").expect("should create");
         let bytes = owid.as_byte_array().expect("should serialize");
         let parsed = Owid::from_byte_array(&bytes).expect("should parse back");
         assert_eq!(parsed.domain(), domain, "domain should round trip");

@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn url_format() {
         let creator = Creator::new("example.com", Crypto::new()).expect("should create");
-        let owid = creator.create_bytes(Vec::new()).expect("should create");
+        let owid = creator.create(Vec::new()).expect("should create");
         assert_eq!(
             public_key_url(&owid, "https"),
             "https://example.com/owid/api/v3/public-key?format=pkcs",

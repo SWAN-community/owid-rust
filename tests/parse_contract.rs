@@ -76,9 +76,7 @@ fn assert_refused(result: Result<Owid, owid::ParseError>, expected: ParseStatus)
 /// OWID, and the status `Parsed`.
 #[test]
 fn success_reports_all_three_facts() {
-    let original = creator()
-        .create_string("Hello World")
-        .expect("should create");
+    let original = creator().create("Hello World").expect("should create");
     let encoded = original.as_base64().expect("should encode");
 
     let result = Owid::from_base64(&encoded);
@@ -96,7 +94,7 @@ fn success_reports_all_three_facts() {
 /// A payload of nothing at all is valid. Having nothing to say is allowed.
 #[test]
 fn empty_payload_parses() {
-    let original = creator().create_bytes(Vec::new()).expect("should create");
+    let original = creator().create(Vec::new()).expect("should create");
     let encoded = original.as_base64().expect("should encode");
 
     let owid = Owid::from_base64(&encoded).expect("an empty payload should parse");
@@ -115,9 +113,7 @@ fn empty_payload_parses() {
 #[test]
 fn one_megabyte_payload_parses() {
     let payload = vec![0x5A; 1024 * 1024];
-    let original = creator()
-        .create_bytes(payload.clone())
-        .expect("should create");
+    let original = creator().create(payload.clone()).expect("should create");
     let encoded = original.as_base64().expect("should encode");
 
     let owid = Owid::from_base64(&encoded).expect("a megabyte payload should parse");
@@ -153,7 +149,7 @@ fn unknown_version_is_reported() {
     let error = Owid::from_byte_array(&[9, 9, 9]).expect_err("should refuse");
     assert_eq!(
         error.detail(),
-        ParseDetail::Version(9),
+        Some(ParseDetail::VersionByte(9)),
         "the detail should name the version byte"
     );
 }
@@ -287,7 +283,7 @@ fn a_failed_read_fetches_no_key() {
 fn a_valid_envelope_with_a_bad_signature_parses_then_fails_verification() {
     let crypto = Crypto::new();
     let creator = Creator::new(DOMAIN, crypto.clone()).expect("should create the creator");
-    let signed = creator.create_string("Hello World").expect("should create");
+    let signed = creator.create("Hello World").expect("should create");
     let mut bytes = signed.as_byte_array().expect("should serialize");
     let last = bytes.len() - 1;
     bytes[last] ^= 0xFF;
@@ -318,9 +314,7 @@ fn a_valid_envelope_with_a_bad_signature_parses_then_fails_verification() {
 /// the identifiers were both fine.
 #[test]
 fn a_key_that_cannot_be_read_is_not_an_invalid_signature() {
-    let owid = creator()
-        .create_string("Hello World")
-        .expect("should create");
+    let owid = creator().create("Hello World").expect("should create");
 
     for pem in ["", "not a PEM at all", "-----BEGIN PUBLIC KEY-----\nAAAA\n"] {
         assert_eq!(
@@ -331,6 +325,22 @@ fn a_key_that_cannot_be_read_is_not_an_invalid_signature() {
     }
 }
 
+/// A key that could not be obtained at all is not a signature that does not
+/// match either. The request here fails in the transport before anything
+/// leaves the machine, because the scheme is not one it can use, so the test
+/// needs no network and no key end point.
+#[cfg(feature = "fetch")]
+#[test]
+fn a_key_that_cannot_be_obtained_is_not_an_invalid_signature() {
+    let owid = creator().create("Hello World").expect("should create");
+
+    assert_eq!(
+        owid.verify_status("no-such-scheme", &[]),
+        SignatureStatus::KeyUnavailable,
+        "a key that could not be fetched should not read as a forgery"
+    );
+}
+
 /// Creating is the second of the two routes to an OWID, and it always
 /// signs. There is no step at which a caller holds an unsigned one.
 #[test]
@@ -339,12 +349,10 @@ fn creating_always_signs() {
     let creator = Creator::new(DOMAIN, crypto.clone()).expect("should create the creator");
 
     for owid in [
-        creator.create_string("Hello World").expect("should create"),
+        creator.create("Hello World").expect("should create"),
+        creator.create(b"bytes".to_vec()).expect("should create"),
         creator
-            .create_bytes(b"bytes".to_vec())
-            .expect("should create"),
-        creator
-            .create_bytes_with_others(b"bytes".to_vec(), &[])
+            .create_with_others(b"bytes".to_vec(), &[])
             .expect("should create"),
     ] {
         assert_eq!(
@@ -369,14 +377,14 @@ fn a_library_user_can_still_do_everything() {
     let root_crypto = Crypto::new();
     let root = Creator::new("root.com", root_crypto.clone())
         .expect("should create the root creator")
-        .create_string("root")
+        .create("root")
         .expect("should create the root");
 
     let processor_crypto = Crypto::new();
     let processor = Creator::new("processor.com", processor_crypto.clone())
         .expect("should create the processor creator");
     let response = processor
-        .create_bytes_with_others(b"response".to_vec(), &[&root])
+        .create_with_others(b"response".to_vec(), &[&root])
         .expect("should create over the others");
 
     assert_eq!(
@@ -405,9 +413,7 @@ fn a_library_user_can_still_do_everything() {
 /// `Owid::payload` proves.
 #[test]
 fn returned_bytes_are_a_view_of_the_owid() {
-    let owid = creator()
-        .create_string("Hello World")
-        .expect("should create");
+    let owid = creator().create("Hello World").expect("should create");
 
     let mut copy = owid.payload().to_vec();
     copy[0] ^= 0xFF;

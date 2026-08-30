@@ -35,9 +35,9 @@ reaches calling code.
    serialized OWID. Data arriving from outside that is not an OWID is an
    ordinary outcome, so the answer is a `ParseError` naming the reason with
    a `ParseStatus`, and never anything raised.
-2. `Creator::create_string` or `Creator::create_bytes` builds and signs one
-   in a single step, owning the version, the domain, the date and the
-   signature, while the caller supplies the payload.
+2. `Creator::create` builds and signs one in a single step, owning the
+   version, the domain, the date and the signature, while the caller
+   supplies the payload, which may be anything that becomes bytes.
 
 There is no public constructor, the fields are private and read only, and
 there is no public way to sign an OWID, because with no way to hold an
@@ -115,7 +115,7 @@ let crypto = Crypto::new();
 let creator = Creator::new("example.com", crypto.clone()).unwrap();
 
 // Creating and signing are one step, so an OWID never exists unsigned.
-let owid = creator.create_string("Hello World").unwrap();
+let owid = creator.create("Hello World").unwrap();
 
 // Serialize to base 64 for storage or transmission.
 let encoded = owid.as_base64().unwrap();
@@ -153,13 +153,13 @@ use owid::{Creator, Crypto, SignatureStatus};
 
 let root = Creator::new("root.com", Crypto::new())
     .unwrap()
-    .create_string("root")
+    .create("root")
     .unwrap();
 
 let crypto = Crypto::new();
 let processor = Creator::new("processor.com", crypto.clone()).unwrap();
 let response = processor
-    .create_bytes_with_others(b"response".to_vec(), &[&root])
+    .create_with_others(b"response".to_vec(), &[&root])
     .unwrap();
 
 // Verification must include the same others.
@@ -228,7 +228,7 @@ fn responses(creator: &Creator) -> (String, String) {
 |`Owid::verify_with_crypto`, `verify_with_public_key`|Verify the signature, optionally with the other OWIDs that were signed together.|
 |`Owid::verify_status_with_crypto`, `verify_status_with_public_key`|The same checks, answered with a `SignatureStatus`.|
 |`Owid::verify`, `verify_status`|Verify by fetching the creator public key over HTTP (`fetch` feature).|
-|`Creator::create_string`, `create_bytes`, `create_bytes_with_others`|Create and sign an OWID in one step. The creator sets the version, the domain and the date.|
+|`Creator::create`, `create_with_others`|Create and sign an OWID in one step, from anything that becomes bytes. The creator sets the version, the domain and the date.|
 |`Crypto::new`, `new_sign_only`, `new_verify_only`|Generate or import keys. Private keys are accepted in both PKCS#8 and SEC1 PEM forms.|
 |`Crypto::public_key_pem`, `private_key_pem`|Export keys as PEM.|
 

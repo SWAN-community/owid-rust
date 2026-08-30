@@ -26,7 +26,7 @@ use crate::crypto::Crypto;
 use crate::error::{Error, Result};
 use crate::io;
 use crate::parse;
-use crate::parse::{ParseDetail, ParseError};
+use crate::parse::ParseError;
 use crate::status::{ParseStatus, SignatureStatus};
 use crate::version::Version;
 
@@ -79,7 +79,7 @@ const BASE64: GeneralPurpose = GeneralPurpose::new(
 /// use owid::{Creator, Crypto};
 ///
 /// let creator = Creator::new("example.com", Crypto::new()).unwrap();
-/// let mut owid = creator.create_string("Hello World").unwrap();
+/// let mut owid = creator.create("Hello World").unwrap();
 ///
 /// // No field can be set or rebound from outside either, so nothing can
 /// // hold an OWID whose signature no longer describes it.
@@ -146,7 +146,7 @@ impl Owid {
     /// use owid::{Creator, Crypto};
     ///
     /// let creator = Creator::new("example.com", Crypto::new()).unwrap();
-    /// let owid = creator.create_string("Hello World").unwrap();
+    /// let owid = creator.create("Hello World").unwrap();
     ///
     /// // The borrow is read only, so this does not compile.
     /// owid.payload()[0] = 0;
@@ -180,25 +180,19 @@ impl Owid {
     /// use owid::{Creator, Crypto, Owid};
     ///
     /// let creator = Creator::new("example.com", Crypto::new()).unwrap();
-    /// let original = creator.create_string("Hello World").unwrap();
+    /// let original = creator.create("Hello World").unwrap();
     /// let copy = Owid::from_base64(&original.as_base64().unwrap()).unwrap();
     /// assert_eq!(original.payload(), copy.payload());
     /// ```
     pub fn from_base64(value: &str) -> std::result::Result<Self, ParseError> {
         if value.is_empty() {
-            return Err(ParseError::new(
-                ParseStatus::MissingInput,
-                ParseDetail::None,
-            ));
+            return Err(ParseError::new(ParseStatus::MissingInput, None));
         }
         match BASE64.decode(value) {
             // The decode error names a position in the input, so it is not
             // carried forward. What a caller can act on is that the string
             // was not base 64.
-            Err(_) => Err(ParseError::new(
-                ParseStatus::InvalidBase64,
-                ParseDetail::None,
-            )),
+            Err(_) => Err(ParseError::new(ParseStatus::InvalidBase64, None)),
             Ok(buffer) => Owid::from_byte_array(&buffer),
         }
     }
@@ -381,7 +375,7 @@ impl Owid {
     ///
     /// let crypto = Crypto::new();
     /// let creator = Creator::new("example.com", crypto.clone()).unwrap();
-    /// let owid = creator.create_string("Hello World").unwrap();
+    /// let owid = creator.create("Hello World").unwrap();
     /// assert!(owid.verify_with_crypto(&crypto, &[]).unwrap());
     /// ```
     pub fn verify_with_crypto(&self, crypto: &Crypto, others: &[&Owid]) -> Result<bool> {
@@ -427,7 +421,7 @@ impl Owid {
     ///
     /// let crypto = Crypto::new();
     /// let creator = Creator::new("example.com", crypto.clone()).unwrap();
-    /// let owid = creator.create_string("Hello World").unwrap();
+    /// let owid = creator.create("Hello World").unwrap();
     ///
     /// let pem = crypto.public_key_pem().unwrap();
     /// assert_eq!(

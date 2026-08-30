@@ -44,12 +44,12 @@ use crate::SIGNATURE_LENGTH;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ParseDetail {
-    /// Nothing is known beyond the status itself.
-    None,
     /// The name of the field the data stopped inside.
     Field(&'static str),
-    /// The version byte that this implementation does not support.
-    Version(u8),
+    /// The version byte that this implementation does not support. Named
+    /// for the byte rather than for the version, because it is a number
+    /// that did not match a [`crate::Version`] rather than one that did.
+    VersionByte(u8),
     /// The payload count the sender declared, and the count actually
     /// present, which is negative when the buffer holds fewer bytes after
     /// the length field than a signature needs.
@@ -71,9 +71,8 @@ pub enum ParseDetail {
 impl fmt::Display for ParseDetail {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ParseDetail::None => Ok(()),
             ParseDetail::Field(name) => write!(f, "stopped inside {name}"),
-            ParseDetail::Version(v) => write!(f, "version '{v}'"),
+            ParseDetail::VersionByte(v) => write!(f, "version '{v}'"),
             ParseDetail::ByteCounts { declared, present } => {
                 write!(f, "declared '{declared}' with '{present}' present")
             }
@@ -99,11 +98,11 @@ impl fmt::Display for ParseDetail {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     status: ParseStatus,
-    detail: ParseDetail,
+    detail: Option<ParseDetail>,
 }
 
 impl ParseError {
-    pub(crate) fn new(status: ParseStatus, detail: ParseDetail) -> Self {
+    pub(crate) fn new(status: ParseStatus, detail: Option<ParseDetail>) -> Self {
         ParseError { status, detail }
     }
 
@@ -112,9 +111,9 @@ impl ParseError {
         self.status
     }
 
-    /// What is known about the failure beyond the status. Never any part
-    /// of the input.
-    pub fn detail(&self) -> ParseDetail {
+    /// What is known about the failure beyond the status, where anything
+    /// is. Never any part of the input.
+    pub fn detail(&self) -> Option<ParseDetail> {
         self.detail
     }
 }
@@ -122,8 +121,8 @@ impl ParseError {
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.detail {
-            ParseDetail::None => write!(f, "{}", self.status),
-            detail => write!(f, "{}: {}", self.status, detail),
+            None => write!(f, "{}", self.status),
+            Some(detail) => write!(f, "{}: {}", self.status, detail),
         }
     }
 }
@@ -132,12 +131,12 @@ impl std::error::Error for ParseError {}
 
 /// Shorthand for a failure with no detail beyond its status.
 fn fail<T>(status: ParseStatus) -> Result<T, ParseError> {
-    Err(ParseError::new(status, ParseDetail::None))
+    Err(ParseError::new(status, None))
 }
 
 /// Shorthand for a failure that knows something more.
 fn fail_with<T>(status: ParseStatus, detail: ParseDetail) -> Result<T, ParseError> {
-    Err(ParseError::new(status, detail))
+    Err(ParseError::new(status, Some(detail)))
 }
 
 /// Reads one complete OWID occupying the whole of the buffer.
@@ -157,7 +156,7 @@ pub(crate) fn parse_exact(buffer: &[u8]) -> Result<Owid, ParseError> {
         Ok(Version::Empty) | Err(_) => {
             return fail_with(
                 ParseStatus::UnsupportedVersion,
-                ParseDetail::Version(buffer[0]),
+                ParseDetail::VersionByte(buffer[0]),
             )
         }
         Ok(version) => version,
@@ -204,18 +203,18 @@ pub(crate) fn parse_exact(buffer: &[u8]) -> Result<Owid, ParseError> {
     let count = usize::try_from(declared).map_err(|_| {
         ParseError::new(
             ParseStatus::ImplementationCapacityExceeded,
-            ParseDetail::Capacity {
+            Some(ParseDetail::Capacity {
                 required: u64::from(declared),
-            },
+            }),
         )
     })?;
     let mut payload = Vec::new();
     payload.try_reserve_exact(count).map_err(|_| {
         ParseError::new(
             ParseStatus::ImplementationCapacityExceeded,
-            ParseDetail::Capacity {
+            Some(ParseDetail::Capacity {
                 required: count as u64,
-            },
+            }),
         )
     })?;
     payload.extend_from_slice(&buffer[at..at + count]);

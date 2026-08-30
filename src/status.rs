@@ -68,9 +68,23 @@ pub enum ParseStatus {
     /// can hold or reserve. Not a fault in the data, and deliberately apart
     /// from the data being wrong, because the same bytes may be readable on
     /// a machine with a wider pointer or more memory.
+    ///
+    /// No test produces one. A declared count is at most the four byte
+    /// field allows, which every 64 bit `usize` can hold, so this needs
+    /// either a target whose pointer is narrower than the count or an
+    /// allocator that refuses the reservation, and neither can be asked for
+    /// on the builds the suite runs on. The mapping is still checked, in
+    /// the tests below, because the count has to be refused rather than
+    /// treated as data that is wrong.
     ImplementationCapacityExceeded,
     /// A fallback for the genuinely unclassified, not a substitute for
     /// naming a failure that is already understood.
+    ///
+    /// Nothing produces one, so no test can. Every way an envelope can be
+    /// wrong is named by one of the statuses above, and the single place
+    /// this is raised is a check that the byte count comparison already
+    /// makes redundant, kept so that a later change to that arithmetic
+    /// cannot quietly start accepting bytes after the envelope.
     MalformedEnvelope,
 }
 
@@ -89,7 +103,7 @@ impl ParseStatus {
     /// use owid::{Creator, Crypto, Owid, ParseStatus};
     ///
     /// let creator = Creator::new("example.com", Crypto::new()).unwrap();
-    /// let encoded = creator.create_string("Hello World").unwrap();
+    /// let encoded = creator.create("Hello World").unwrap();
     /// let encoded = encoded.as_base64().unwrap();
     ///
     /// let result = Owid::from_base64(&encoded);
@@ -105,9 +119,9 @@ impl ParseStatus {
         }
     }
 
-    /// The cross language name of the status, which is what
-    /// [`fmt::Display`] writes.
-    pub fn name(self) -> &'static str {
+    /// The cross language name of the status, borrowed rather than built,
+    /// which is what [`fmt::Display`] writes.
+    pub fn as_str(self) -> &'static str {
         match self {
             ParseStatus::Parsed => "Parsed",
             ParseStatus::MissingInput => "MissingInput",
@@ -124,7 +138,7 @@ impl ParseStatus {
 
 impl fmt::Display for ParseStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+        f.write_str(self.as_str())
     }
 }
 
@@ -166,12 +180,20 @@ pub enum SignatureStatus {
     /// later change lets one through.
     InvalidSignatureLength,
     /// No key could be obtained, so the signature was never examined.
+    ///
+    /// Reached through the `fetch` feature, where the key comes from the
+    /// creator domain over HTTP and the request can fail. Every
+    /// [`crate::Crypto`] this crate can build carries a verifying key, so
+    /// a key held in hand is never missing.
     KeyUnavailable,
     /// Key material arrived but cannot be decoded, imported, or used as the
     /// type required. The fault is in the key, not in the identifier.
     InvalidKey,
     /// The data to check the signature over is larger than this build can
-    /// reserve, so the check could not be attempted.
+    /// reserve, so the check could not be attempted. No test produces one,
+    /// for the reason given on
+    /// [`ParseStatus::ImplementationCapacityExceeded`], and the mapping is
+    /// checked in the tests below.
     ImplementationCapacityExceeded,
     /// The check could not be completed for a reason that is not the
     /// identifier's fault. Nothing in this crate produces it today for the
@@ -203,9 +225,9 @@ impl SignatureStatus {
         }
     }
 
-    /// The cross language name of the status, which is what
-    /// [`fmt::Display`] writes.
-    pub fn name(self) -> &'static str {
+    /// The cross language name of the status, borrowed rather than built,
+    /// which is what [`fmt::Display`] writes.
+    pub fn as_str(self) -> &'static str {
         match self {
             SignatureStatus::Valid => "SignatureValid",
             SignatureStatus::Invalid => "SignatureInvalid",
@@ -220,7 +242,7 @@ impl SignatureStatus {
 
 impl fmt::Display for SignatureStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+        f.write_str(self.as_str())
     }
 }
 
@@ -252,33 +274,176 @@ mod tests {
         assert_eq!(SignatureStatus::InvalidKey.to_string(), "InvalidKey");
     }
 
-    /// Nothing that is not the signature failing to match may be reported
-    /// as an invalid signature, because that would read as an attack when
-    /// it is an outage.
+    /// The outcomes that must produce each signature status.
+    ///
+    /// The match has no wildcard, so a member added to the vocabulary
+    /// without a decision about how it is reached will not compile.
+    fn outcomes_for(status: SignatureStatus) -> Vec<crate::error::Result<bool>> {
+        match status {
+            SignatureStatus::Valid => vec![Ok(true)],
+            SignatureStatus::Invalid => vec![Ok(false)],
+            SignatureStatus::InvalidSignatureLength => {
+                vec![Err(Error::InvalidSignatureLength(63))]
+            }
+            SignatureStatus::KeyUnavailable => vec![
+                Err(Error::KeyMissing("verify a signature")),
+                Err(Error::Http("connection refused".to_owned())),
+            ],
+            SignatureStatus::InvalidKey => vec![
+                Err(Error::Key("bad PEM".to_owned())),
+                Err(Error::InvalidKeyFormat("xyz".to_owned())),
+            ],
+            SignatureStatus::ImplementationCapacityExceeded => {
+                vec![Err(Error::ImplementationCapacityExceeded { required: 1 })]
+            }
+            SignatureStatus::VerificationError => vec![Err(Error::DateOutOfRange)],
+        }
+    }
+
+    /// Every member of the signature vocabulary has a case, so none is
+    /// silently untested, including the two nothing in this crate can
+    /// produce, whose mapping still has to be right. Only a signature that
+    /// does not match may be reported as invalid, because anything else
+    /// read that way would report an outage as an attack.
     #[test]
-    fn only_a_mismatch_is_reported_as_invalid() {
-        assert_eq!(SignatureStatus::of(Ok(true)), SignatureStatus::Valid);
-        assert_eq!(SignatureStatus::of(Ok(false)), SignatureStatus::Invalid);
-        for error in [
-            Error::Key("bad PEM".to_owned()),
-            Error::KeyMissing("verify a signature"),
-            Error::Http("connection refused".to_owned()),
-            Error::InvalidKeyFormat("xyz".to_owned()),
-            Error::InvalidSignatureLength(63),
-            Error::ImplementationCapacityExceeded { required: 1 },
-            Error::DateOutOfRange,
+    fn every_signature_status_is_mapped_from_the_outcome_that_means_it() {
+        for status in [
+            SignatureStatus::Valid,
+            SignatureStatus::Invalid,
+            SignatureStatus::InvalidSignatureLength,
+            SignatureStatus::KeyUnavailable,
+            SignatureStatus::InvalidKey,
+            SignatureStatus::ImplementationCapacityExceeded,
+            SignatureStatus::VerificationError,
         ] {
-            let status = SignatureStatus::of(Err(error));
-            assert_ne!(
-                status,
-                SignatureStatus::Invalid,
-                "an error that is not a mismatch must not read as a forgery"
-            );
-            assert_ne!(
-                status,
-                SignatureStatus::Valid,
-                "an error must never read as a genuine signature"
-            );
+            for outcome in outcomes_for(status) {
+                let was_error = outcome.is_err();
+                assert_eq!(
+                    SignatureStatus::of(outcome),
+                    status,
+                    "should map to {status}"
+                );
+                if was_error {
+                    assert_ne!(
+                        status,
+                        SignatureStatus::Invalid,
+                        "an error that is not a mismatch must not read as a forgery"
+                    );
+                    assert_ne!(
+                        status,
+                        SignatureStatus::Valid,
+                        "an error must never read as a genuine signature"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What has to be read to produce each parse status.
+    enum Case {
+        /// Bytes that must be read with the status.
+        Bytes(Vec<u8>),
+        /// A string offered to the base 64 reader.
+        Text(&'static str),
+        /// A status this crate cannot produce, for the reason recorded on
+        /// the member itself.
+        CannotBeProduced,
+    }
+
+    /// The input that must produce each parse status.
+    ///
+    /// The match has no wildcard, so a member added to the vocabulary
+    /// without a decision about how it is reached will not compile, which
+    /// is what stops a status being added and never tested.
+    fn case_for(status: ParseStatus) -> Case {
+        match status {
+            ParseStatus::Parsed => Case::Bytes(signed_envelope()),
+            ParseStatus::MissingInput => Case::Bytes(Vec::new()),
+            ParseStatus::InvalidBase64 => Case::Text("not base 64!"),
+            // The empty marker, which says an OWID is absent, is a version
+            // this reader does not accept as an envelope.
+            ParseStatus::UnsupportedVersion => Case::Bytes(vec![0]),
+            ParseStatus::UnexpectedEnd => Case::Bytes(vec![3, b'a', b'b']),
+            ParseStatus::InvalidDomainEncoding => {
+                let mut bytes = vec![3, 0xFF, 0xFE, 0];
+                bytes.extend_from_slice(&1000u32.to_le_bytes());
+                bytes.extend_from_slice(&0u32.to_le_bytes());
+                bytes.extend_from_slice(&[0x99; crate::SIGNATURE_LENGTH]);
+                Case::Bytes(bytes)
+            }
+            ParseStatus::ByteCountMismatch => {
+                let mut bytes = signed_envelope();
+                bytes.push(0);
+                Case::Bytes(bytes)
+            }
+            ParseStatus::ImplementationCapacityExceeded => Case::CannotBeProduced,
+            ParseStatus::MalformedEnvelope => Case::CannotBeProduced,
+        }
+    }
+
+    /// A complete envelope, signed, so the successful case is a real OWID
+    /// rather than bytes shaped like one.
+    fn signed_envelope() -> Vec<u8> {
+        let creator = crate::Creator::new("test.com", crate::Crypto::new())
+            .expect("should create the creator");
+        creator
+            .create("Hello World")
+            .expect("should create")
+            .as_byte_array()
+            .expect("should serialize")
+    }
+
+    /// Every member of the parse vocabulary has a case, so none is silently
+    /// untested. The two that cannot be produced say so on the member, and
+    /// this holds that claim to account by failing if one of them ever
+    /// starts coming back.
+    #[test]
+    fn every_parse_status_has_a_case() {
+        for status in [
+            ParseStatus::Parsed,
+            ParseStatus::MissingInput,
+            ParseStatus::InvalidBase64,
+            ParseStatus::UnsupportedVersion,
+            ParseStatus::UnexpectedEnd,
+            ParseStatus::InvalidDomainEncoding,
+            ParseStatus::ByteCountMismatch,
+            ParseStatus::ImplementationCapacityExceeded,
+            ParseStatus::MalformedEnvelope,
+        ] {
+            match case_for(status) {
+                Case::Bytes(bytes) => {
+                    let result = Owid::from_byte_array(&bytes);
+                    assert_eq!(
+                        ParseStatus::of(&result),
+                        status,
+                        "reading these bytes should report {status}"
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        status == ParseStatus::Parsed,
+                        "only {} may come with an OWID",
+                        ParseStatus::Parsed
+                    );
+                }
+                Case::Text(text) => {
+                    let result = Owid::from_base64(text);
+                    assert_eq!(
+                        ParseStatus::of(&result),
+                        status,
+                        "reading this string should report {status}"
+                    );
+                    assert!(result.is_err(), "a failure should hand back no OWID");
+                }
+                Case::CannotBeProduced => {
+                    for bytes in [Vec::new(), vec![0], signed_envelope()] {
+                        assert_ne!(
+                            ParseStatus::of(&Owid::from_byte_array(&bytes)),
+                            status,
+                            "{status} is documented as one this crate does not produce"
+                        );
+                    }
+                }
+            }
         }
     }
 }

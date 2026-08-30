@@ -73,9 +73,9 @@
 //!    serialized OWID. Bytes that are not one are an ordinary outcome, so
 //!    the answer is a [`ParseError`] naming the reason with a
 //!    [`ParseStatus`], rather than anything exceptional.
-//! 2. [`Creator::create_string`] or [`Creator::create_bytes`] builds and
-//!    signs one in a single step, owning the version, the domain, the date
-//!    and the signature.
+//! 2. [`Creator::create`] builds and signs one in a single step, owning
+//!    the version, the domain, the date and the signature. The payload may
+//!    be anything that becomes bytes.
 //!
 //! Whether the bytes are an OWID and whether its signature is genuine are
 //! two questions with two answers. A successful read says nothing about the
@@ -93,7 +93,7 @@
 //! let creator = Creator::new("example.com", crypto.clone()).unwrap();
 //!
 //! // Create and sign an OWID with a payload.
-//! let owid = creator.create_string("Hello World").unwrap();
+//! let owid = creator.create("Hello World").unwrap();
 //!
 //! // Serialize to base 64 for storage or transmission.
 //! let encoded = owid.as_base64().unwrap();

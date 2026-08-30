@@ -34,7 +34,7 @@ fn main() -> owid::Result<()> {
 
     // Create and sign an OWID with a payload. Creating and signing are one
     // step, so an OWID never exists without a signature.
-    let owid = creator.create_string("Hello World")?;
+    let owid = creator.create("Hello World")?;
     let encoded = owid.as_base64()?;
     println!("Signed OWID: {encoded}");
 
@@ -51,7 +51,7 @@ fn main() -> owid::Result<()> {
     // signing its own OWID together with the one received.
     let processor_crypto = Crypto::new();
     let processor = Creator::new("processor.com", processor_crypto.clone())?;
-    let response = processor.create_bytes_with_others(b"processed".to_vec(), &[&copy])?;
+    let response = processor.create_with_others(b"processed".to_vec(), &[&copy])?;
     println!(
         "Processor OWID verifies with the original: {}",
         response.verify_with_crypto(&processor_crypto, &[&copy])?

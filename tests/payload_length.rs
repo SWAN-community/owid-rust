@@ -177,7 +177,7 @@ fn matching_one_mebibyte_payload_parses() {
 fn library_output_parses() {
     let creator = Creator::new(DOMAIN, Crypto::new()).expect("should create the creator");
     let original = creator
-        .create_string("Hello World")
+        .create("Hello World")
         .expect("should create the OWID");
     let bytes = original.as_byte_array().expect("should serialize");
     let parsed = Owid::from_byte_array(&bytes).expect("should parse the crate output");
@@ -217,7 +217,7 @@ fn declared_length_off_by_one_is_refused() {
         );
         assert_eq!(
             error.detail(),
-            ParseDetail::ByteCounts { declared, present },
+            Some(ParseDetail::ByteCounts { declared, present }),
             "the detail should name both counts"
         );
         let message = error.to_string();
@@ -269,10 +269,10 @@ fn short_signature_is_refused() {
     );
     assert_eq!(
         error.detail(),
-        ParseDetail::ByteCounts {
+        Some(ParseDetail::ByteCounts {
             declared: payload.len() as u32,
             present: payload.len() as i64 - 1
-        },
+        }),
         "the count present should be one short of the declaration"
     );
 }
@@ -291,10 +291,10 @@ fn fewer_bytes_than_a_signature_gives_a_negative_count() {
     );
     assert_eq!(
         error.detail(),
-        ParseDetail::ByteCounts {
+        Some(ParseDetail::ByteCounts {
             declared: 0,
             present: 4 - SIGNATURE_LENGTH as i64
-        },
+        }),
         "the count present should be negative"
     );
 }
@@ -319,7 +319,7 @@ fn mismatched_large_declaration_is_refused_without_allocating() {
         assert!(
             matches!(
                 error.detail(),
-                ParseDetail::ByteCounts { declared: d, .. } if d == declared
+                Some(ParseDetail::ByteCounts { declared: d, .. }) if d == declared
             ),
             "the detail should name the declared count, got {:?}",
             error.detail()
@@ -473,7 +473,7 @@ fn library_output_with_maximum_domain_parses() {
     let domain = domain_of_length(253);
     let creator = Creator::new(&domain, Crypto::new()).expect("should create the creator");
     let original = creator
-        .create_string("Hello World")
+        .create("Hello World")
         .expect("should create the OWID");
     let bytes = original.as_byte_array().expect("should serialize");
     let parsed = Owid::from_byte_array(&bytes).expect("should parse the crate output");
