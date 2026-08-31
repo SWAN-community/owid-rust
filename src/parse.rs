@@ -362,14 +362,21 @@ pub(crate) fn read_date(bytes: &[u8], version: Version) -> Result<DateTime<Utc>,
         return fail_with(ParseStatus::UnexpectedEnd, ParseDetail::Field("the date"));
     }
     match version {
-        // Version 1 counted whole hours in two big endian bytes.
+        // Version 1 counted whole hours in two big endian bytes, which
+        // reach 65,535 hours and June 2027, so the addition cannot
+        // overflow and there is nothing to guard.
         Version::Version1 => {
             let hours = i64::from(bytes[0]) << 8 | i64::from(bytes[1]);
             Ok(base_date() + Duration::hours(hours))
         }
         // Every later version counts minutes in four little endian bytes.
-        // The widest value a sender can write is inside what a date can
-        // hold, so the addition cannot overflow.
+        // The widest count a sender can write is 4,294,967,295 minutes,
+        // which is 15 February 10186, and chrono's `NaiveDate::MAX` is the
+        // end of the year 262142, so the addition cannot overflow and no
+        // guard is needed. That is proved rather than remembered, because
+        // the tests in tests/parse_contract.rs read the maximum count on
+        // both contracts against the chrono this crate builds with, where
+        // other runtimes stop at the year 9999 and have to refuse it.
         _ => {
             let minutes = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             Ok(base_date() + Duration::minutes(i64::from(minutes)))
