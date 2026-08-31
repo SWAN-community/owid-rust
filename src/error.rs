@@ -19,7 +19,12 @@ use std::fmt;
 /// Result type used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Errors that can occur when creating, reading, signing, or verifying OWIDs.
+/// Errors that can occur when creating, signing, serializing, or verifying
+/// OWIDs.
+///
+/// Reading an OWID from bytes that came from outside answers with a
+/// [`crate::ParseError`] instead, because data that is not an OWID is an
+/// ordinary outcome there rather than a fault in the program.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -27,35 +32,14 @@ pub enum Error {
     UnsupportedVersion(u8),
     /// The signature is not exactly the required number of bytes.
     InvalidSignatureLength(usize),
-    /// The buffer ended before all the expected fields were read.
-    UnexpectedEndOfBuffer,
-    /// The declared payload length does not leave exactly the signature
-    /// after the payload. `declared` is the length the sender wrote in the
-    /// four byte length field and `present` is the number of bytes that
-    /// follow the length field, of which the final
-    /// [`crate::SIGNATURE_LENGTH`] must be the signature.
-    PayloadLengthMismatch {
-        /// The payload length read from the length field.
-        declared: u32,
-        /// The bytes present after the length field.
-        present: usize,
-    },
-    /// The base 64 string could not be decoded.
-    Base64(base64::DecodeError),
     /// The domain is empty, or contains a null character which would
     /// conflict with the null terminated string encoding.
     InvalidDomain(String),
-    /// The domain bytes read from the buffer are not valid UTF-8.
-    InvalidDomainEncoding,
-    /// The domain field is longer than the published maximum length of a
-    /// domain name. Reading, the field has no null terminator within that
-    /// many characters, so the domain is either longer than a domain name
-    /// can be or its terminator is missing, and the parse refuses the
-    /// buffer at that point rather than reading on, so the cost of a
-    /// buffer with no terminator does not grow with its length. Writing,
-    /// the domain supplied is longer than the maximum, so it is refused
-    /// when it is supplied rather than serialized into an OWID this crate
-    /// would then refuse to read.
+    /// The domain supplied is longer than the published maximum length of
+    /// a domain name, so it is refused when it is supplied rather than
+    /// serialized into an OWID this crate would then refuse to read. The
+    /// same field arriving over long in a buffer being read is
+    /// [`crate::ParseStatus::InvalidDomainEncoding`] instead.
     DomainTooLong,
     /// The date can not be represented in the encoding used by the version.
     DateOutOfRange,
@@ -80,6 +64,12 @@ pub enum Error {
     /// the underlying error message. Only returned when the `fetch` feature
     /// is enabled.
     Http(String),
+    /// Bytes offered to be read were not an OWID.
+    ///
+    /// Reading answers with a [`crate::ParseError`] of its own, and this
+    /// carries one so that a caller whose own functions return this type
+    /// can use `?` on a read as well as on the rest of the crate.
+    Parse(crate::ParseError),
 }
 
 impl fmt::Display for Error {
@@ -94,21 +84,7 @@ impl fmt::Display for Error {
                  signature length",
                 crate::SIGNATURE_LENGTH
             ),
-            Error::UnexpectedEndOfBuffer => {
-                write!(f, "buffer ended before the OWID was complete")
-            }
-            Error::PayloadLengthMismatch { declared, present } => write!(
-                f,
-                "OWID payload length '{declared}' does not match the \
-                 '{present}' bytes present, of which the final '{}' must \
-                 be the signature",
-                crate::SIGNATURE_LENGTH
-            ),
-            Error::Base64(e) => write!(f, "base 64 decoding failed because {e}"),
             Error::InvalidDomain(d) => write!(f, "domain '{d}' is not valid"),
-            Error::InvalidDomainEncoding => {
-                write!(f, "domain bytes are not valid UTF-8")
-            }
             Error::DomainTooLong => write!(
                 f,
                 "domain field exceeds the '{}' character maximum",
@@ -135,6 +111,7 @@ impl fmt::Display for Error {
                  received '{v}'"
             ),
             Error::Http(e) => write!(f, "HTTP request failed because {e}"),
+            Error::Parse(e) => write!(f, "bytes are not an OWID because {e}"),
         }
     }
 }
@@ -142,14 +119,14 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Base64(e) => Some(e),
+            Error::Parse(e) => Some(e),
             _ => None,
         }
     }
 }
 
-impl From<base64::DecodeError> for Error {
-    fn from(e: base64::DecodeError) -> Self {
-        Error::Base64(e)
+impl From<crate::ParseError> for Error {
+    fn from(e: crate::ParseError) -> Self {
+        Error::Parse(e)
     }
 }

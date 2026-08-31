@@ -33,11 +33,14 @@
 //! again when an OWID carrying one is serialized, are here too. The unit
 //! tests in `src/creator.rs` and `src/io.rs` check the same boundary
 //! against the constant itself, which an integration test can not see.
+//! The write bound is checked there as well, because an OWID carrying a
+//! domain a creator would refuse can no longer be assembled from outside
+//! the crate.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use owid::{Creator, Crypto, Error, Owid, Version, SIGNATURE_LENGTH};
+use owid::{Creator, Crypto, Error, Owid, ParseDetail, ParseStatus, Version, SIGNATURE_LENGTH};
 
 thread_local! {
     /// Bytes requested from the allocator on this thread since the count
@@ -145,9 +148,9 @@ fn declared_length_matches_parses() {
     let bytes = envelope(payload.len() as u32, &payload, &signature);
     let (result, allocated) = allocated_by(|| Owid::from_byte_array(&bytes));
     let owid = result.expect("should parse");
-    assert_eq!(owid.payload, payload, "payload should round trip");
-    assert_eq!(owid.signature, signature, "signature should round trip");
-    assert_eq!(owid.domain, DOMAIN, "domain should round trip");
+    assert_eq!(owid.payload(), payload, "payload should round trip");
+    assert_eq!(owid.signature(), signature, "signature should round trip");
+    assert_eq!(owid.domain(), DOMAIN, "domain should round trip");
     assert!(
         allocated >= payload.len() + signature.len(),
         "a parse that copies {} bytes requested only {allocated}",
@@ -165,7 +168,7 @@ fn matching_one_mebibyte_payload_parses() {
 
     let parsed = Owid::from_byte_array(&bytes).expect("matching payload should parse");
 
-    assert_eq!(parsed.payload, payload);
+    assert_eq!(parsed.payload(), payload);
 }
 
 /// A round trip through the crate's own signing path still parses, so the
@@ -174,42 +177,48 @@ fn matching_one_mebibyte_payload_parses() {
 fn library_output_parses() {
     let creator = Creator::new(DOMAIN, Crypto::new()).expect("should create the creator");
     let original = creator
-        .sign_string("Hello World")
-        .expect("should sign the OWID");
+        .create("Hello World")
+        .expect("should create the OWID");
     let bytes = original.as_byte_array().expect("should serialize");
     let parsed = Owid::from_byte_array(&bytes).expect("should parse the crate output");
     assert_eq!(
-        parsed.payload, original.payload,
+        parsed.payload(),
+        original.payload(),
         "payload should round trip"
     );
     assert_eq!(
-        parsed.signature, original.signature,
+        parsed.signature(),
+        original.signature(),
         "signature should round trip"
     );
-    assert_eq!(parsed.domain, original.domain, "domain should round trip");
+    assert_eq!(
+        parsed.domain(),
+        original.domain(),
+        "domain should round trip"
+    );
 }
 
 /// One more or one fewer than the bytes present is refused, because either
-/// leaves something other than exactly the signature at the end. The error
-/// names the declared length and the bytes present so the reader of a log
-/// can see which one is wrong.
+/// leaves something other than exactly the signature at the end. The
+/// failure names the declared count and the count present so the reader of
+/// a log can see which one is wrong, and neither is text from the input.
 #[test]
 fn declared_length_off_by_one_is_refused() {
     let payload = payload();
     let signature = signature();
-    let present = payload.len() + signature.len();
+    let present = payload.len() as i64;
     for declared in [payload.len() as u32 - 1, payload.len() as u32 + 1] {
         let bytes = envelope(declared, &payload, &signature);
         let error = Owid::from_byte_array(&bytes).expect_err("should refuse");
-        assert!(
-            matches!(
-                error,
-                Error::PayloadLengthMismatch {
-                    declared: d,
-                    present: p
-                } if d == declared && p == present
-            ),
-            "declared {declared} should be refused as a mismatch, got {error:?}"
+        assert_eq!(
+            error.status(),
+            ParseStatus::ByteCountMismatch,
+            "declared {declared} should be refused as a mismatch"
+        );
+        assert_eq!(
+            error.detail(),
+            Some(ParseDetail::ByteCounts { declared, present }),
+            "the detail should name both counts"
         );
         let message = error.to_string();
         assert!(
@@ -218,12 +227,8 @@ fn declared_length_off_by_one_is_refused() {
         );
         assert_eq!(
             message,
-            format!(
-                "OWID payload length '{declared}' does not match the \
-                 '{present}' bytes present, of which the final '64' must \
-                 be the signature"
-            ),
-            "message should name both lengths"
+            format!("ByteCountMismatch: declared '{declared}' with '{present}' present"),
+            "message should name both counts"
         );
     }
 }
@@ -236,14 +241,18 @@ fn trailing_byte_after_signature_is_refused() {
     let mut bytes = envelope(payload.len() as u32, &payload, &signature());
     bytes.push(0);
     let error = Owid::from_byte_array(&bytes).expect_err("should refuse");
-    assert!(
-        matches!(error, Error::PayloadLengthMismatch { .. }),
-        "trailing byte should be refused as a mismatch, got {error:?}"
+    assert_eq!(
+        error.status(),
+        ParseStatus::ByteCountMismatch,
+        "a trailing byte should be refused as a mismatch"
     );
 }
 
-/// A short signature is refused. The declared payload length is right for
-/// the payload, but the bytes after it are fewer than a signature.
+/// A short signature is refused as a mismatch. The declared payload length
+/// is right for the payload, but the bytes after it are fewer than a
+/// signature, so the declaration cannot leave exactly the signature the
+/// version requires. That is the finding whichever way the bytes fall
+/// short, including when the buffer also stopped early.
 #[test]
 fn short_signature_is_refused() {
     let payload = payload();
@@ -253,9 +262,40 @@ fn short_signature_is_refused() {
         &[0x99; SIGNATURE_LENGTH - 1],
     );
     let error = Owid::from_byte_array(&bytes).expect_err("should refuse");
-    assert!(
-        matches!(error, Error::PayloadLengthMismatch { .. }),
-        "short signature should be refused as a mismatch, got {error:?}"
+    assert_eq!(
+        error.status(),
+        ParseStatus::ByteCountMismatch,
+        "a short signature should be refused as a mismatch"
+    );
+    assert_eq!(
+        error.detail(),
+        Some(ParseDetail::ByteCounts {
+            declared: payload.len() as u32,
+            present: payload.len() as i64 - 1
+        }),
+        "the count present should be one short of the declaration"
+    );
+}
+
+/// A buffer holding fewer bytes after the length field than a signature
+/// needs gives a negative count present rather than one that has wrapped
+/// round to something enormous, so it can never equal a declaration.
+#[test]
+fn fewer_bytes_than_a_signature_gives_a_negative_count() {
+    let bytes = envelope(0, &[], &[0x99; 4]);
+    let error = Owid::from_byte_array(&bytes).expect_err("should refuse");
+    assert_eq!(
+        error.status(),
+        ParseStatus::ByteCountMismatch,
+        "a buffer with no room for a signature should be a mismatch"
+    );
+    assert_eq!(
+        error.detail(),
+        Some(ParseDetail::ByteCounts {
+            declared: 0,
+            present: 4 - SIGNATURE_LENGTH as i64
+        }),
+        "the count present should be negative"
     );
 }
 
@@ -271,9 +311,18 @@ fn mismatched_large_declaration_is_refused_without_allocating() {
         let bytes = envelope(declared, &[], &[]);
         let (result, allocated) = allocated_by(|| Owid::from_byte_array(&bytes));
         let error = result.expect_err("should refuse");
+        assert_eq!(
+            error.status(),
+            ParseStatus::ByteCountMismatch,
+            "declared {declared} should be refused as a mismatch"
+        );
         assert!(
-            matches!(error, Error::PayloadLengthMismatch { declared: d, .. } if d == declared),
-            "declared {declared} should be refused as a mismatch, got {error:?}"
+            matches!(
+                error.detail(),
+                Some(ParseDetail::ByteCounts { declared: d, .. }) if d == declared
+            ),
+            "the detail should name the declared count, got {:?}",
+            error.detail()
         );
         assert!(
             allocated < 64 * 1024,
@@ -289,8 +338,8 @@ fn empty_payload_parses() {
     let signature = signature();
     let bytes = envelope(0, &[], &signature);
     let owid = Owid::from_byte_array(&bytes).expect("should parse");
-    assert!(owid.payload.is_empty(), "payload should be empty");
-    assert_eq!(owid.signature, signature, "signature should round trip");
+    assert!(owid.payload().is_empty(), "payload should be empty");
+    assert_eq!(owid.signature(), signature, "signature should round trip");
 }
 
 /// A domain of exactly the maximum length parses and round trips. These
@@ -306,9 +355,9 @@ fn domain_of_maximum_length_parses() {
     let signature = signature();
     let bytes = envelope_with_domain(&domain, payload.len() as u32, &payload, &signature);
     let owid = Owid::from_byte_array(&bytes).expect("the longest valid domain should parse");
-    assert_eq!(owid.domain, domain, "domain should round trip");
-    assert_eq!(owid.payload, payload, "payload should round trip");
-    assert_eq!(owid.signature, signature, "signature should round trip");
+    assert_eq!(owid.domain(), domain, "domain should round trip");
+    assert_eq!(owid.payload(), payload, "payload should round trip");
+    assert_eq!(owid.signature(), signature, "signature should round trip");
 }
 
 /// One character more than the maximum is refused. The terminator sits at
@@ -321,13 +370,14 @@ fn domain_over_maximum_is_refused() {
     let payload = payload();
     let bytes = envelope_with_domain(&domain, payload.len() as u32, &payload, &signature());
     let error = Owid::from_byte_array(&bytes).expect_err("should refuse");
-    assert!(
-        matches!(error, Error::DomainTooLong),
-        "a domain one character over the maximum should be refused, got {error:?}"
+    assert_eq!(
+        error.status(),
+        ParseStatus::InvalidDomainEncoding,
+        "a domain one character over the maximum should be refused"
     );
     assert_eq!(
         error.to_string(),
-        "domain field exceeds the '253' character maximum",
+        "InvalidDomainEncoding: longer than the '253' character maximum, or not terminated",
         "message should name the maximum"
     );
 }
@@ -344,9 +394,10 @@ fn unterminated_domain_is_refused_without_allocating() {
         bytes.resize(length, b'a');
         let (result, allocated) = allocated_by(|| Owid::from_byte_array(&bytes));
         let error = result.expect_err("should refuse");
-        assert!(
-            matches!(error, Error::DomainTooLong),
-            "an unterminated domain should be refused, got {error:?}"
+        assert_eq!(
+            error.status(),
+            ParseStatus::InvalidDomainEncoding,
+            "an unterminated domain should be refused"
         );
         assert!(
             allocated < 64 * 1024,
@@ -370,9 +421,10 @@ fn far_terminator_domain_is_refused_without_copying_the_buffer() {
     bytes.push(0);
     let (result, allocated) = allocated_by(|| Owid::from_byte_array(&bytes));
     let error = result.expect_err("should refuse");
-    assert!(
-        matches!(error, Error::DomainTooLong),
-        "a terminator beyond the maximum should be refused, got {error:?}"
+    assert_eq!(
+        error.status(),
+        ParseStatus::InvalidDomainEncoding,
+        "a terminator beyond the maximum should be refused"
     );
     assert!(
         allocated < 64 * 1024,
@@ -387,9 +439,10 @@ fn far_terminator_domain_is_refused_without_copying_the_buffer() {
 fn short_unterminated_domain_is_end_of_buffer() {
     let bytes = vec![Version::Version3.as_byte(), b'a', b'b', b'c'];
     let error = Owid::from_byte_array(&bytes).expect_err("should refuse");
-    assert!(
-        matches!(error, Error::UnexpectedEndOfBuffer),
-        "a short unterminated domain should be an end of buffer, got {error:?}"
+    assert_eq!(
+        error.status(),
+        ParseStatus::UnexpectedEnd,
+        "a short unterminated domain should be an unexpected end"
     );
 }
 
@@ -412,44 +465,6 @@ fn creator_over_maximum_domain_is_refused() {
     );
 }
 
-/// An OWID whose domain was set through the public field, rather than by
-/// a creator, is refused when it is serialized, so the bound is not
-/// avoided by that route. Everything else about the OWID is well formed,
-/// including a full length signature, so the domain is the only thing
-/// wrong with it.
-#[test]
-fn serializing_over_maximum_domain_is_refused() {
-    let owid = Owid {
-        domain: domain_of_length(254),
-        payload: payload(),
-        signature: signature(),
-        ..Owid::default()
-    };
-    let error = owid.as_byte_array().expect_err("should refuse");
-    assert!(
-        matches!(error, Error::DomainTooLong),
-        "serializing a domain over the maximum should be refused, got {error:?}"
-    );
-}
-
-/// An OWID whose domain is exactly the maximum still serializes and
-/// parses back, so the write bound refuses nothing the read accepts.
-#[test]
-fn serializing_maximum_domain_succeeds() {
-    let owid = Owid {
-        domain: domain_of_length(253),
-        payload: payload(),
-        signature: signature(),
-        ..Owid::default()
-    };
-    let bytes = owid
-        .as_byte_array()
-        .expect("the longest valid domain should serialize");
-    let parsed = Owid::from_byte_array(&bytes).expect("should parse back");
-    assert_eq!(parsed.domain, owid.domain, "domain should round trip");
-    assert_eq!(parsed.payload, owid.payload, "payload should round trip");
-}
-
 /// The crate signs and parses back an OWID whose domain is the maximum
 /// length, so the bound agrees with what the crate itself writes at the
 /// boundary and not only with hand built buffers.
@@ -458,17 +473,19 @@ fn library_output_with_maximum_domain_parses() {
     let domain = domain_of_length(253);
     let creator = Creator::new(&domain, Crypto::new()).expect("should create the creator");
     let original = creator
-        .sign_string("Hello World")
-        .expect("should sign the OWID");
+        .create("Hello World")
+        .expect("should create the OWID");
     let bytes = original.as_byte_array().expect("should serialize");
     let parsed = Owid::from_byte_array(&bytes).expect("should parse the crate output");
-    assert_eq!(parsed.domain, domain, "domain should round trip");
+    assert_eq!(parsed.domain(), domain, "domain should round trip");
     assert_eq!(
-        parsed.payload, original.payload,
+        parsed.payload(),
+        original.payload(),
         "payload should round trip"
     );
     assert_eq!(
-        parsed.signature, original.signature,
+        parsed.signature(),
+        original.signature(),
         "signature should round trip"
     );
 }

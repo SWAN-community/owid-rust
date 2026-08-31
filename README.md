@@ -25,6 +25,33 @@ environments. Two optional features extend it.
 * `endpoints` adds framework agnostic helpers for hosting the well known end
   points that an OWID creator must serve.
 
+## How an OWID comes into being
+
+An OWID is only worth anything because it is signed, so this crate does not
+let one exist in an unsigned state. There are exactly two ways an instance
+reaches calling code.
+
+1. `Owid::from_base64` or `Owid::from_byte_array` reads a complete
+   serialized OWID, and `Owid::read_from_prefix` reads one from the front of
+   a buffer carrying more after it. Data arriving from outside that is not
+   an OWID is an ordinary outcome, so the answer is a `ParseError` naming
+   the reason with a `ParseStatus`, and never anything raised.
+2. `Creator::create` builds and signs one in a single step, owning the
+   version, the domain, the date and the signature, while the caller
+   supplies the payload, which may be anything that becomes bytes.
+
+There is no public constructor, the fields are private and read only, and
+there is no public way to sign an OWID, because with no way to hold an
+unsigned one there is nothing outside to sign and re-signing one would
+replace a signature its fields were read with.
+
+Whether bytes are an OWID and whether the signature on it is genuine are two
+questions with two answers. A successful read says nothing about the
+signature. `verify_status_with_public_key` answers the second question with
+a `SignatureStatus` that keeps a signature that does not match apart from a
+check that could not be made at all, so a key that cannot be fetched or
+decoded never reads as a forgery.
+
 ## Payload size and application limits
 
 The OWID wire format stores the payload length as an unsigned 32 bit value,
@@ -53,11 +80,11 @@ limits suitable for their use case and enforce them before buffering the
 binary form or decoding Base64. An implementation capacity failure or an
 application policy rejection is distinct from an invalid OWID.
 
-For transport input, limit the complete HTTP body or encoded envelope; allow
-for the domain and other OWID fields as well as the payload. After parsing,
-`owid.payload.len()` reports the actual payload size without another copy and
-can be used for downstream policy. The parser cannot choose either limit on
-behalf of the application.
+For transport input, limit the complete HTTP body or encoded envelope,
+allowing for the domain and the other OWID fields as well as the payload.
+After parsing, `owid.payload().len()` reports the actual payload size
+without another copy and can be used for downstream policy. The parser
+cannot choose either limit on behalf of the application.
 
 ## Installation
 
@@ -65,14 +92,14 @@ Add the crate to `Cargo.toml`.
 
 ```toml
 [dependencies]
-owid = "0.1"
+owid = "2"
 ```
 
 Enable the optional features as needed.
 
 ```toml
 [dependencies]
-owid = { version = "0.1", features = ["fetch", "endpoints"] }
+owid = { version = "2", features = ["fetch", "endpoints"] }
 ```
 
 ## Usage
@@ -86,61 +113,127 @@ use owid::{Creator, Crypto, Owid};
 // generates a new ECDSA P-256 key pair. Keys can also be imported from PEM
 // with Crypto::new_sign_only and Crypto::new_verify_only.
 let crypto = Crypto::new();
-let creator = Creator::new("example.com", crypto.clone())?;
+let creator = Creator::new("example.com", crypto.clone()).unwrap();
 
-// Create and sign an OWID with a payload.
-let owid = creator.sign_string("Hello World")?;
+// Creating and signing are one step, so an OWID never exists unsigned.
+let owid = creator.create("Hello World").unwrap();
 
 // Serialize to base 64 for storage or transmission.
-let encoded = owid.as_base64()?;
+let encoded = owid.as_base64().unwrap();
 
-// Later, or elsewhere, decode and verify with the creator public key.
-let copy = Owid::from_base64(&encoded)?;
-let public_pem = crypto.public_key_pem()?;
-assert!(copy.verify_with_public_key(&public_pem, &[])?);
+// Later, or elsewhere, read it back and verify with the creator public key.
+let copy = Owid::from_base64(&encoded).unwrap();
+let public_pem = crypto.public_key_pem().unwrap();
+assert!(copy.verify_with_public_key(&public_pem, &[]).unwrap());
 ```
 
-Sign an OWID together with other OWIDs, as a processor does when adding
-itself to a transaction. The same others, in the same order, must be passed
-when verifying.
+Read an OWID that came from outside, where data that is not an OWID is an
+ordinary outcome rather than a fault.
+
+```rust
+use owid::{Owid, ParseStatus};
+
+let result = Owid::from_base64("not base 64!");
+match result {
+    Ok(owid) => println!("read an OWID created by {}", owid.domain()),
+    Err(error) => {
+        // The reason is a named status, so nothing has to match on message
+        // text, and no detail ever carries text from the input.
+        assert_eq!(error.status(), ParseStatus::InvalidBase64);
+        println!("not an OWID because {error}");
+    }
+}
+```
+
+Walk a buffer carrying one OWID after another. The framed read hands back
+the bytes that follow the frame it read, which is what reading the next one
+needs, and it says nothing about them, because they may be the next frame
+rather than rubbish. A frame may also hold the one byte marker standing for
+a node that is not there, which it steps over, handing back `None` so a
+caller can tell an absent node from a malformed one.
 
 ```rust
 use owid::{Creator, Crypto, Owid};
 
-let creator = Creator::new("processor.com", Crypto::new())?;
+let creator = Creator::new("example.com", Crypto::new()).unwrap();
+let mut buffer = Vec::new();
+for payload in ["first", "second"] {
+    creator.create(payload).unwrap().to_buffer(&mut buffer).unwrap();
+}
 
-let root = Owid::from_base64("[signed OWID]")?;
-let mut response = Owid {
-    payload: b"response".to_vec(),
-    ..Owid::default()
-};
-creator.sign_with_others(&mut response, &[&root])?;
+let mut rest = buffer.as_slice();
+let mut payloads = Vec::new();
+while !rest.is_empty() {
+    let (owid, remainder) = Owid::read_from_prefix(rest).unwrap();
+    // None where the frame said the node is not there.
+    if let Some(owid) = owid {
+        payloads.push(owid.payload_as_string());
+    }
+    rest = remainder;
+}
+assert_eq!(payloads, ["first", "second"]);
+```
+
+The whole buffer read refuses that same buffer, because there a buffer holds
+one OWID and nothing else could own the bytes after it. The two reads
+otherwise report the same reasons, differing in three answers, all listed
+under the data structure notes below.
+
+Create an OWID whose signature covers other OWIDs as well, as a processor
+does when adding itself to a transaction. The same others, in the same
+order, must be passed when verifying.
+
+```rust
+use owid::{Creator, Crypto, SignatureStatus};
+
+let root = Creator::new("root.com", Crypto::new())
+    .unwrap()
+    .create("root")
+    .unwrap();
+
+let crypto = Crypto::new();
+let processor = Creator::new("processor.com", crypto.clone()).unwrap();
+let response = processor
+    .create_with_others(b"response".to_vec(), &[&root])
+    .unwrap();
 
 // Verification must include the same others.
-assert!(response.verify_with_crypto(creator.crypto(), &[&root])?);
+assert_eq!(
+    response.verify_status_with_crypto(&crypto, &[&root]),
+    SignatureStatus::Valid);
 ```
 
 Verify an OWID by fetching the creator public key from the well known end
-point. Requires the `fetch` feature.
+point. Requires the `fetch` feature. A key that cannot be fetched or read is
+never reported as a signature that does not match.
 
 ```rust
-use owid::Owid;
+use owid::{Owid, SignatureStatus};
 
-let owid = Owid::from_base64("[signed OWID]")?;
-let valid = owid.verify("https", &[])?;
+fn check(encoded: &str) -> SignatureStatus {
+    match Owid::from_base64(encoded) {
+        Ok(owid) => owid.verify_status("https", &[]),
+        Err(_) => SignatureStatus::VerificationError,
+    }
+}
 ```
 
 Host the well known end points with any HTTP framework. Requires the
 `endpoints` feature.
 
 ```rust
-use owid::endpoints;
+use owid::{endpoints, Creator};
 
-// GET /owid/api/v3/creator
-let body = endpoints::creator_response(&creator, "Example Org", "")?;
+fn responses(creator: &Creator) -> (String, String) {
+    // GET /owid/api/v3/creator
+    let creator_body =
+        endpoints::creator_response(creator, "Example Org", "").unwrap();
 
-// GET /owid/api/v3/public-key?format=spki
-let body = endpoints::public_key_response(&creator, "spki")?;
+    // GET /owid/api/v3/public-key?format=spki
+    let key_body = endpoints::public_key_response(creator, "spki").unwrap();
+
+    (creator_body, key_body)
+}
 ```
 
 ## Interface
@@ -149,24 +242,30 @@ let body = endpoints::public_key_response(&creator, "spki")?;
 
 |Type|Description|
 |-|-|
-|`Owid`|The OWID structure with version, domain, date, payload, and signature fields. Parses from and serializes to bytes and base 64.|
+|`Owid`|The OWID, with its version, domain, date, payload and signature. Read only, and obtained only by reading a complete serialized OWID or from a `Creator` that creates and signs one.|
 |`Creator`|Binds a domain to a signing key. Creates and signs OWIDs.|
 |`Crypto`|Holds the ECDSA P-256 keys. Generates key pairs, imports and exports PEM, signs and verifies byte arrays.|
 |`Configuration`|Domain and key PEM settings used to construct a `Creator`.|
 |`Version`|The OWID version byte. Version 3 is current. Versions 1 and 2 are readable for compatibility.|
-|`Error`|All errors returned by the crate.|
+|`ParseError`, `ParseStatus`, `ParseDetail`|Why bytes are not an OWID, or are the marker for a node that is not there. The status is the cross language name for the reason. A detail carries counts, a fixed field name and the one version byte that was not recognised, so a log never receives the domain, the payload or any other text the sender chose.|
+|`SignatureStatus`|The outcome of asking whether a signature is genuine, keeping a signature that does not match apart from a check that could not be made.|
+|`Error`|Errors from creating, signing, serializing and verifying.|
 
 ### Methods
 
 |Method|Description|
 |-|-|
-|`Owid::from_base64`, `Owid::from_byte_array`|Parse an OWID. Base 64 is accepted with or without padding.|
-|`Owid::as_base64`, `Owid::as_byte_array`|Serialize a signed OWID.|
-|`Owid::payload_as_string`, `payload_as_printable`, `payload_as_base64`|Payload accessors as UTF-8 text, hexadecimal, and base 64.|
+|`Owid::from_base64`, `Owid::from_byte_array`|Read an OWID from a buffer that holds one, answering with a `ParseError` where the bytes are not one. Base 64 is accepted with or without padding.|
+|`Owid::read_from_prefix`|Read one frame from the front of a buffer carrying more after it, returning what it held, which is `None` for the absent node marker, with the bytes that follow. Consumes nothing when it fails.|
+|`Owid::as_base64`, `Owid::as_byte_array`|Serialize an OWID.|
+|`Owid::to_buffer`, `Owid::empty_to_buffer`|Append an OWID, or the one byte marker for a node that is not there, to a buffer that carries a run of frames.|
+|`Owid::version`, `domain`, `date`, `payload`, `signature`|Read the fields. The byte fields come back as read only views.|
+|`Owid::payload_as_string`, `payload_as_printable`, `payload_as_base64`|The payload as UTF-8 text, hexadecimal, and base 64.|
 |`Owid::age_minutes`|Complete minutes elapsed since creation.|
 |`Owid::verify_with_crypto`, `verify_with_public_key`|Verify the signature, optionally with the other OWIDs that were signed together.|
-|`Owid::verify`|Verify by fetching the creator public key over HTTP (`fetch` feature).|
-|`Creator::sign`, `sign_with_others`, `sign_string`, `sign_bytes`|Create and sign OWIDs. Signing sets the domain and the date.|
+|`Owid::verify_status_with_crypto`, `verify_status_with_public_key`|The same checks, answered with a `SignatureStatus`.|
+|`Owid::verify`, `verify_status`|Verify by fetching the creator public key over HTTP (`fetch` feature).|
+|`Creator::create`, `create_with_others`|Create and sign an OWID in one step, from anything that becomes bytes. The creator sets the version, the domain and the date.|
 |`Crypto::new`, `new_sign_only`, `new_verify_only`|Generate or import keys. Private keys are accepted in both PKCS#8 and SEC1 PEM forms.|
 |`Crypto::public_key_pem`, `private_key_pem`|Export keys as PEM.|
 
@@ -186,6 +285,23 @@ of everything before it.
 * The deprecated version 1 date field stores a two byte big endian count of
   hours since the base date.
 * `payload_as_printable` returns zero padded lower case hexadecimal.
+* The marker `Owid::empty_to_buffer` writes is a single zero byte saying a
+  node is not there. No OWID is handed back for one on either read, because
+  it carries no signature.
+* The two reads differ in three answers, and agree everywhere else.
+  * A whole buffer read requires the declared payload to leave exactly the
+    signature, so a byte after it is a `ByteCountMismatch`. A framed read
+    requires only that the payload and the signature are present and says
+    nothing about what follows.
+  * A frame whose declared payload runs past the bytes supplied is an
+    `UnexpectedEnd`, being data that stopped early, so a caller reading a
+    source that is still arriving can wait for more bytes rather than give
+    up. `ByteCountMismatch` is only reachable on the whole buffer read,
+    where every byte is present by definition.
+  * A framed read steps over the marker and hands back `None` with the
+    bytes after it, reporting `AbsentNode`. A whole buffer read reports
+    `AbsentNode` as well, because a marker is a meaningful thing to find
+    and not an unsupported version, but it has nothing to hand back.
 * Base 64 is accepted with or without padding. Output is always padded.
 * Signatures are deterministic (RFC 6979). Verification accepts any valid
   ECDSA P-256 signature, whether produced deterministically or with a
@@ -197,7 +313,13 @@ The unit tests cover creation, signing, serialization, and verification
 across all supported versions. The compatibility and interop suites include
 externally produced fixtures, with byte exact round trips and verification
 of signatures generated outside this library, proving that the wire format
-and the signature verification are portable.
+and the signature verification are portable. `tests/parse_contract.rs`
+holds the cross language status matrix, being the reasons a read reports
+and the proof that an OWID cannot be held unsigned.
+
+The examples in this file are documentation tests, so `cargo test
+--all-features` compiles and runs them and they cannot quietly stop
+working.
 
 ```bash
 cargo test

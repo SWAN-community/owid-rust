@@ -27,6 +27,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::error::{Error, Result};
 use crate::owid::Owid;
+use crate::status::SignatureStatus;
 
 /// Cache used to avoid repeat requests for the same public keys.
 fn cache() -> &'static Mutex<HashMap<String, String>> {
@@ -40,8 +41,8 @@ pub fn public_key_url(owid: &Owid, scheme: &str) -> String {
     format!(
         "{}://{}/owid/api/v{}/public-key?format=pkcs",
         scheme,
-        owid.domain,
-        owid.version.as_byte()
+        owid.domain(),
+        owid.version().as_byte()
     )
 }
 
@@ -81,17 +82,32 @@ impl Owid {
         let pem = public_key_pem(&public_key_url(self, scheme))?;
         self.verify_with_public_key(&pem, others)
     }
+
+    /// The same check as [`Owid::verify`], answered with the status that
+    /// names the outcome.
+    ///
+    /// A key that can not be fetched is
+    /// [`SignatureStatus::KeyUnavailable`] and one that arrives in a form
+    /// this crate can not read is [`SignatureStatus::InvalidKey`]. Neither
+    /// is [`SignatureStatus::Invalid`], because an outage or a badly served
+    /// key leaves the signature unjudged and reporting it as invalid would
+    /// read as an attack.
+    pub fn verify_status(&self, scheme: &str, others: &[&Owid]) -> SignatureStatus {
+        SignatureStatus::of(self.verify(scheme, others))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use crate::creator::Creator;
+    use crate::crypto::Crypto;
 
     /// The URL must match the well known end point in the specification.
     #[test]
     fn url_format() {
-        let owid = Owid::new("example.com", Utc::now(), Vec::new());
+        let creator = Creator::new("example.com", Crypto::new()).expect("should create");
+        let owid = creator.create(Vec::new()).expect("should create");
         assert_eq!(
             public_key_url(&owid, "https"),
             "https://example.com/owid/api/v3/public-key?format=pkcs",

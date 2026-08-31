@@ -32,8 +32,9 @@ fn main() -> owid::Result<()> {
     println!("Public key for example.com:");
     println!("{}", crypto.public_key_pem()?);
 
-    // Create and sign an OWID with a payload.
-    let owid = creator.sign_string("Hello World")?;
+    // Create and sign an OWID with a payload. Creating and signing are one
+    // step, so an OWID never exists without a signature.
+    let owid = creator.create("Hello World")?;
     let encoded = owid.as_base64()?;
     println!("Signed OWID: {encoded}");
 
@@ -42,7 +43,7 @@ fn main() -> owid::Result<()> {
     println!(
         "Payload '{}' created by '{}' verifies: {}",
         copy.payload_as_string(),
-        copy.domain,
+        copy.domain(),
         copy.verify_with_crypto(&crypto, &[])?
     );
 
@@ -50,11 +51,7 @@ fn main() -> owid::Result<()> {
     // signing its own OWID together with the one received.
     let processor_crypto = Crypto::new();
     let processor = Creator::new("processor.com", processor_crypto.clone())?;
-    let mut response = Owid {
-        payload: b"processed".to_vec(),
-        ..Owid::default()
-    };
-    processor.sign_with_others(&mut response, &[&copy])?;
+    let response = processor.create_with_others(b"processed".to_vec(), &[&copy])?;
     println!(
         "Processor OWID verifies with the original: {}",
         response.verify_with_crypto(&processor_crypto, &[&copy])?
@@ -64,12 +61,20 @@ fn main() -> owid::Result<()> {
         response.verify_with_crypto(&processor_crypto, &[])?
     );
 
-    // Any change after signing breaks verification. OWIDs are immutable.
-    let mut tampered = copy.clone();
-    tampered.payload = b"Hello Worle".to_vec();
+    // Any change after signing breaks verification. An OWID is read only,
+    // so tampering happens to the bytes, which is how it would reach a
+    // verifier in practice.
+    let mut bytes = copy.as_byte_array()?;
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    let tampered = Owid::from_byte_array(&bytes)?;
     println!(
         "Tampered OWID verifies: {}",
         tampered.verify_with_crypto(&crypto, &[])?
+    );
+    println!(
+        "Tampered OWID signature status: {}",
+        tampered.verify_status_with_crypto(&crypto, &[])
     );
 
     Ok(())

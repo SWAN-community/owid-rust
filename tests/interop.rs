@@ -105,13 +105,18 @@ const DOTNET: LanguageFixtures = LanguageFixtures {
 
 const LANGUAGES: [&LanguageFixtures; 2] = [&GO, &DOTNET];
 
-/// Returns the fixture with the final byte of its decoded form, always a
-/// signature byte, inverted.
+/// Returns the fixture with the final byte of its serialized form, always
+/// a signature byte, inverted.
+///
+/// The change is made to the bytes and read back, which is how tampering
+/// actually reaches a verifier. An OWID cannot be changed in memory,
+/// because its signature covers the fields as they arrived.
 fn tamper(fixture: &str) -> Owid {
-    let mut owid = Owid::from_base64(fixture).expect("should parse the fixture");
-    let last = owid.signature.len() - 1;
-    owid.signature[last] ^= 0xFF;
-    owid
+    let owid = Owid::from_base64(fixture).expect("should parse the fixture");
+    let mut bytes = owid.as_byte_array().expect("should serialize");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    Owid::from_byte_array(&bytes).expect("a tampered signature should still parse")
 }
 
 /// Every fixture signed alone verifies with the public key of the language
@@ -214,9 +219,9 @@ fn utf8_payloads_preserved() {
 fn fixture_fields_match() {
     for language in LANGUAGES {
         let owid = Owid::from_base64(language.simple).expect("should parse the fixture");
-        assert_eq!(owid.domain, language.domain, "domain should match");
+        assert_eq!(owid.domain(), language.domain, "domain should match");
         assert_eq!(owid.payload_as_string(), "example", "payload should match");
-        assert_eq!(owid.signature.len(), 64, "signature should be 64 bytes");
+        assert_eq!(owid.signature().len(), 64, "signature should be 64 bytes");
     }
 }
 
