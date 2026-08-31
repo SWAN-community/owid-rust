@@ -41,10 +41,13 @@
 //! the base date. Versions 1 and 2 are deprecated and supported for reading
 //! existing data only.
 //!
-//! The signature is the end of the OWID. When reading, the payload length
-//! must leave exactly the 64 signature bytes after the payload, so a buffer
-//! with bytes after the signature, or with fewer than 64 bytes after the
-//! payload, is refused as malformed.
+//! The signature is the end of the OWID. Reading a buffer that holds one
+//! OWID, the payload length must leave exactly the 64 signature bytes after
+//! the payload, so a buffer with bytes after the signature, or with fewer
+//! than 64 bytes after the payload, is refused as malformed. Reading one
+//! from the front of a longer buffer with [`Owid::read_from_prefix`], the
+//! payload and the 64 signature bytes must be present and whatever follows
+//! them is handed back, because it may be the next envelope.
 //!
 //! The domain is found by reading forward to its null terminator, and that
 //! read stops at the maximum length a domain name is allowed to be, so a
@@ -70,9 +73,11 @@
 //! instance reaches calling code.
 //!
 //! 1. [`Owid::from_base64`] or [`Owid::from_byte_array`] reads a complete
-//!    serialized OWID. Bytes that are not one are an ordinary outcome, so
-//!    the answer is a [`ParseError`] naming the reason with a
-//!    [`ParseStatus`], rather than anything exceptional.
+//!    serialized OWID, and [`Owid::read_from_prefix`] reads one from the
+//!    front of a buffer that carries more after it. Bytes that are not an
+//!    OWID are an ordinary outcome, so the answer is a [`ParseError`]
+//!    naming the reason with a [`ParseStatus`], rather than anything
+//!    exceptional.
 //! 2. [`Creator::create`] builds and signs one in a single step, owning
 //!    the version, the domain, the date and the signature. The payload may
 //!    be anything that becomes bytes.

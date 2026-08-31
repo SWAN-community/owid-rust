@@ -198,7 +198,9 @@ impl Owid {
     }
 
     /// Reads an OWID from its binary form. The buffer must hold exactly one
-    /// complete OWID, so bytes after the signature are refused.
+    /// complete OWID, so bytes after the signature are refused. Where a
+    /// buffer carries a run of them, or an OWID followed by something else,
+    /// use [`Owid::read_from_prefix`] instead.
     ///
     /// # Errors
     ///
@@ -218,6 +220,57 @@ impl Owid {
     /// ```
     pub fn from_byte_array(buffer: &[u8]) -> std::result::Result<Self, ParseError> {
         parse::parse_exact(buffer)
+    }
+
+    /// Reads one OWID from the front of a buffer that carries more than one
+    /// thing, returning it with the bytes that follow.
+    ///
+    /// Use this where OWIDs arrive one after another, or where an OWID sits
+    /// inside a larger format. It differs from [`Owid::from_byte_array`] in
+    /// one place, being that it requires only the declared payload and the
+    /// signature to be present and says nothing about what comes after
+    /// them, because what comes after them may be the next envelope rather
+    /// than rubbish. Everything else, including the statuses it reports, is
+    /// the same.
+    ///
+    /// The bytes that follow are returned rather than a count of the bytes
+    /// used, because reading the next envelope is what a caller does next
+    /// and the remainder is what that needs, with the borrow checker
+    /// keeping the arithmetic honest. `buffer.len() - rest.len()` is the
+    /// length of the envelope where a caller wants the number. This is the
+    /// shape `zerocopy` uses for `read_from_prefix`.
+    ///
+    /// Nothing is consumed when this fails, since the remainder is handed
+    /// back only on success, so a failed read cannot leave a caller part
+    /// way through an envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ParseError`] whose [`ParseError::status`] names the
+    /// reason, from the same vocabulary as the whole buffer read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use owid::{Creator, Crypto, Owid};
+    ///
+    /// let creator = Creator::new("example.com", Crypto::new()).unwrap();
+    /// let mut buffer = Vec::new();
+    /// for payload in ["first", "second"] {
+    ///     creator.create(payload).unwrap().to_buffer(&mut buffer).unwrap();
+    /// }
+    ///
+    /// let mut rest = buffer.as_slice();
+    /// let mut payloads = Vec::new();
+    /// while !rest.is_empty() {
+    ///     let (owid, remainder) = Owid::read_from_prefix(rest).unwrap();
+    ///     payloads.push(owid.payload_as_string());
+    ///     rest = remainder;
+    /// }
+    /// assert_eq!(payloads, ["first", "second"]);
+    /// ```
+    pub fn read_from_prefix(buffer: &[u8]) -> std::result::Result<(Self, &[u8]), ParseError> {
+        parse::parse_prefix(buffer)
     }
 
     /// Returns the OWID as a byte array.

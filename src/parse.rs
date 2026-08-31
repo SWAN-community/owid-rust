@@ -22,10 +22,13 @@
 //! because the data comes from outside, and whoever sends it chooses how
 //! often this fails and how large each attempt is.
 //!
-//! This is the exact buffer contract. The envelope must end where the buffer
-//! does, so a byte after the signature is refused. The crate reads no framed
-//! stream, where an envelope is followed by more data, so nothing here has
-//! to decide whether trailing bytes are rubbish or the next envelope.
+//! There are two ways to read, and they differ in one comparison. The whole
+//! buffer read requires the envelope to end where the buffer does, so a byte
+//! after the signature is refused, because in a buffer holding one OWID
+//! nothing else could own that byte. The framed read requires only that the
+//! declared payload and the signature are present, and says nothing about
+//! what follows, because what follows may be the next envelope rather than
+//! rubbish.
 
 use std::fmt;
 
@@ -139,8 +142,37 @@ fn fail_with<T>(status: ParseStatus, detail: ParseDetail) -> Result<T, ParseErro
     Err(ParseError::new(status, Some(detail)))
 }
 
+/// How much of the buffer the envelope has to account for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Extent {
+    /// The envelope is the whole buffer and must end where it does.
+    WholeBuffer,
+    /// The envelope is at the front of the buffer and whatever follows
+    /// belongs to whoever is reading the next one.
+    Prefix,
+}
+
 /// Reads one complete OWID occupying the whole of the buffer.
 pub(crate) fn parse_exact(buffer: &[u8]) -> Result<Owid, ParseError> {
+    let (owid, used) = parse_one(buffer, Extent::WholeBuffer)?;
+    debug_assert_eq!(used, buffer.len(), "the whole buffer read consumes it all");
+    Ok(owid)
+}
+
+/// Reads one complete OWID from the front of the buffer, returning it with
+/// the bytes that follow it.
+///
+/// Nothing is consumed when this fails, because the buffer is borrowed and
+/// the bytes that follow are handed back only on success, so a caller can
+/// never be left part way through an envelope it could not read.
+pub(crate) fn parse_prefix(buffer: &[u8]) -> Result<(Owid, &[u8]), ParseError> {
+    let (owid, used) = parse_one(buffer, Extent::Prefix)?;
+    Ok((owid, &buffer[used..]))
+}
+
+/// Reads one envelope from the front of the buffer, returning it with the
+/// number of bytes it occupied.
+fn parse_one(buffer: &[u8], extent: Extent) -> Result<(Owid, usize), ParseError> {
     // An empty buffer is nothing to read rather than something that ran
     // out. Rust has no null to tell apart from it, so the two cases the
     // other implementations separate are one case here.
@@ -187,10 +219,20 @@ pub(crate) fn parse_exact(buffer: &[u8]) -> Result<Owid, ParseError> {
     //
     // The disagreement is the finding even when the buffer also stopped
     // early. What a reader can say for certain is that the declared
-    // payload cannot leave exactly the signature the version requires, and
-    // that is true whichever way the bytes fall short.
+    // payload cannot leave the signature the version requires, and that is
+    // true whichever way the bytes fall short.
+    //
+    // This comparison is the one place the two reads differ. A whole
+    // buffer holds one OWID, so the count has to match exactly and a byte
+    // after the signature is a disagreement. A framed read only needs the
+    // payload and the signature to be there, because the bytes after them
+    // belong to whoever reads the next envelope.
     let present = (total - at) as i64 - SIGNATURE_LENGTH as i64;
-    if present != i64::from(declared) {
+    let enough = match extent {
+        Extent::WholeBuffer => present == i64::from(declared),
+        Extent::Prefix => present >= i64::from(declared),
+    };
+    if !enough {
         return fail_with(
             ParseStatus::ByteCountMismatch,
             ParseDetail::ByteCounts { declared, present },
@@ -223,14 +265,18 @@ pub(crate) fn parse_exact(buffer: &[u8]) -> Result<Owid, ParseError> {
     let signature = buffer[at..at + SIGNATURE_LENGTH].to_vec();
     at += SIGNATURE_LENGTH;
 
-    if at != total {
+    if extent == Extent::WholeBuffer && at != total {
         // Unreachable while the count check above holds, and kept so that
         // a later change to that arithmetic cannot quietly start accepting
-        // bytes after the envelope.
+        // bytes after the envelope. The framed read is not held to this,
+        // because bytes after the envelope are the point of it.
         return fail(ParseStatus::MalformedEnvelope);
     }
 
-    Ok(Owid::from_parts(version, domain, date, payload, signature))
+    Ok((
+        Owid::from_parts(version, domain, date, payload, signature),
+        at,
+    ))
 }
 
 /// Reads the creator domain from the start of the bytes, returning it with

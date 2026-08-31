@@ -32,9 +32,10 @@ let one exist in an unsigned state. There are exactly two ways an instance
 reaches calling code.
 
 1. `Owid::from_base64` or `Owid::from_byte_array` reads a complete
-   serialized OWID. Data arriving from outside that is not an OWID is an
-   ordinary outcome, so the answer is a `ParseError` naming the reason with
-   a `ParseStatus`, and never anything raised.
+   serialized OWID, and `Owid::read_from_prefix` reads one from the front of
+   a buffer carrying more after it. Data arriving from outside that is not
+   an OWID is an ordinary outcome, so the answer is a `ParseError` naming
+   the reason with a `ParseStatus`, and never anything raised.
 2. `Creator::create` builds and signs one in a single step, owning the
    version, the domain, the date and the signature, while the caller
    supplies the payload, which may be anything that becomes bytes.
@@ -144,6 +145,35 @@ match result {
 }
 ```
 
+Walk a buffer carrying one OWID after another. The framed read hands back
+the bytes that follow the envelope it read, which is what reading the next
+one needs, and it says nothing about them, because they may be the next
+envelope rather than rubbish.
+
+```rust
+use owid::{Creator, Crypto, Owid};
+
+let creator = Creator::new("example.com", Crypto::new()).unwrap();
+let mut buffer = Vec::new();
+for payload in ["first", "second"] {
+    creator.create(payload).unwrap().to_buffer(&mut buffer).unwrap();
+}
+
+let mut rest = buffer.as_slice();
+let mut payloads = Vec::new();
+while !rest.is_empty() {
+    let (owid, remainder) = Owid::read_from_prefix(rest).unwrap();
+    payloads.push(owid.payload_as_string());
+    rest = remainder;
+}
+assert_eq!(payloads, ["first", "second"]);
+```
+
+The whole buffer read refuses that same buffer, because there a buffer holds
+one OWID and nothing else could own the bytes after it. That is the only
+difference between the two reads, and they report the same reasons
+otherwise.
+
 Create an OWID whose signature covers other OWIDs as well, as a processor
 does when adding itself to a transaction. The same others, in the same
 order, must be passed when verifying.
@@ -220,7 +250,8 @@ fn responses(creator: &Creator) -> (String, String) {
 
 |Method|Description|
 |-|-|
-|`Owid::from_base64`, `Owid::from_byte_array`|Read an OWID, answering with a `ParseError` where the bytes are not one. Base 64 is accepted with or without padding.|
+|`Owid::from_base64`, `Owid::from_byte_array`|Read an OWID from a buffer that holds one, answering with a `ParseError` where the bytes are not one. Base 64 is accepted with or without padding.|
+|`Owid::read_from_prefix`|Read one OWID from the front of a buffer carrying more after it, returning it with the bytes that follow. Consumes nothing when it fails.|
 |`Owid::as_base64`, `Owid::as_byte_array`|Serialize an OWID.|
 |`Owid::version`, `domain`, `date`, `payload`, `signature`|Read the fields. The byte fields come back as read only views.|
 |`Owid::payload_as_string`, `payload_as_printable`, `payload_as_base64`|The payload as UTF-8 text, hexadecimal, and base 64.|
@@ -251,6 +282,10 @@ of everything before it.
 * The marker `Owid::empty_to_buffer` writes is a single zero byte saying an
   optional OWID is absent. A marker is not an OWID, so reading one as a
   complete envelope reports `UnsupportedVersion`.
+* A whole buffer read requires the declared payload to leave exactly the
+  signature, so a byte after it is a `ByteCountMismatch`. A framed read
+  requires the payload and the signature to be present and says nothing
+  about what follows. Everything else about the two reads is the same.
 * Base 64 is accepted with or without padding. Output is always padded.
 * Signatures are deterministic (RFC 6979). Verification accepts any valid
   ECDSA P-256 signature, whether produced deterministically or with a

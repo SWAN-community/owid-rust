@@ -22,7 +22,6 @@
 use std::fmt;
 
 use crate::error::Error;
-use crate::owid::Owid;
 use crate::parse::ParseError;
 
 /// Why reading an OWID succeeded or failed.
@@ -89,13 +88,14 @@ pub enum ParseStatus {
 }
 
 impl ParseStatus {
-    /// The status of a parse outcome, being [`Self::Parsed`] when it worked
-    /// and the reason it did not otherwise.
+    /// The status of a read, being [`Self::Parsed`] when it worked and the
+    /// reason it did not otherwise.
     ///
     /// A [`Result`] already says whether the read worked and holds the OWID
     /// only when it did, so this exists for the third fact, which is the
     /// named reason, in the one place where success has no error to carry
-    /// it.
+    /// it. It takes the outcome of either read, the framed one handing back
+    /// the remaining bytes alongside the OWID.
     ///
     /// # Examples
     ///
@@ -112,7 +112,7 @@ impl ParseStatus {
     /// let result = Owid::from_base64("not base 64!");
     /// assert_eq!(ParseStatus::of(&result), ParseStatus::InvalidBase64);
     /// ```
-    pub fn of(result: &Result<Owid, ParseError>) -> ParseStatus {
+    pub fn of<T>(result: &Result<T, ParseError>) -> ParseStatus {
         match result {
             Ok(_) => ParseStatus::Parsed,
             Err(e) => e.status(),
@@ -249,6 +249,7 @@ impl fmt::Display for SignatureStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owid::Owid;
 
     /// The names are the cross language vocabulary, so a status written to
     /// a log or compared across implementations reads the same everywhere.
@@ -341,9 +342,15 @@ mod tests {
 
     /// What has to be read to produce each parse status.
     enum Case {
-        /// Bytes that must be read with the status.
-        Bytes(Vec<u8>),
-        /// A string offered to the base 64 reader.
+        /// Bytes that the whole buffer read must answer with the status,
+        /// together with what the framed read must answer for the same
+        /// bytes. The two agree everywhere except where the whole buffer
+        /// read is refusing bytes after the envelope, which is the one
+        /// place the two contracts differ.
+        Bytes { bytes: Vec<u8>, framed: ParseStatus },
+        /// A string offered to the base 64 reader. There is no framed read
+        /// of base 64, because a run of envelopes is decoded once and then
+        /// walked as bytes.
         Text(&'static str),
         /// A status this crate cannot produce, for the reason recorded on
         /// the member itself.
@@ -357,24 +364,46 @@ mod tests {
     /// is what stops a status being added and never tested.
     fn case_for(status: ParseStatus) -> Case {
         match status {
-            ParseStatus::Parsed => Case::Bytes(signed_envelope()),
-            ParseStatus::MissingInput => Case::Bytes(Vec::new()),
+            ParseStatus::Parsed => Case::Bytes {
+                bytes: signed_envelope(),
+                framed: ParseStatus::Parsed,
+            },
+            ParseStatus::MissingInput => Case::Bytes {
+                bytes: Vec::new(),
+                framed: ParseStatus::MissingInput,
+            },
             ParseStatus::InvalidBase64 => Case::Text("not base 64!"),
             // The empty marker, which says an OWID is absent, is a version
             // this reader does not accept as an envelope.
-            ParseStatus::UnsupportedVersion => Case::Bytes(vec![0]),
-            ParseStatus::UnexpectedEnd => Case::Bytes(vec![3, b'a', b'b']),
+            ParseStatus::UnsupportedVersion => Case::Bytes {
+                bytes: vec![0],
+                framed: ParseStatus::UnsupportedVersion,
+            },
+            ParseStatus::UnexpectedEnd => Case::Bytes {
+                bytes: vec![3, b'a', b'b'],
+                framed: ParseStatus::UnexpectedEnd,
+            },
             ParseStatus::InvalidDomainEncoding => {
                 let mut bytes = vec![3, 0xFF, 0xFE, 0];
                 bytes.extend_from_slice(&1000u32.to_le_bytes());
                 bytes.extend_from_slice(&0u32.to_le_bytes());
                 bytes.extend_from_slice(&[0x99; crate::SIGNATURE_LENGTH]);
-                Case::Bytes(bytes)
+                Case::Bytes {
+                    bytes,
+                    framed: ParseStatus::InvalidDomainEncoding,
+                }
             }
+            // A byte after the signature. The whole buffer read refuses it,
+            // because nothing else in a buffer holding one OWID could own
+            // it, and the framed read hands it back as the start of
+            // whatever comes next.
             ParseStatus::ByteCountMismatch => {
                 let mut bytes = signed_envelope();
                 bytes.push(0);
-                Case::Bytes(bytes)
+                Case::Bytes {
+                    bytes,
+                    framed: ParseStatus::Parsed,
+                }
             }
             ParseStatus::ImplementationCapacityExceeded => Case::CannotBeProduced,
             ParseStatus::MalformedEnvelope => Case::CannotBeProduced,
@@ -411,7 +440,7 @@ mod tests {
             ParseStatus::MalformedEnvelope,
         ] {
             match case_for(status) {
-                Case::Bytes(bytes) => {
+                Case::Bytes { bytes, framed } => {
                     let result = Owid::from_byte_array(&bytes);
                     assert_eq!(
                         ParseStatus::of(&result),
@@ -421,6 +450,18 @@ mod tests {
                     assert_eq!(
                         result.is_ok(),
                         status == ParseStatus::Parsed,
+                        "only {} may come with an OWID",
+                        ParseStatus::Parsed
+                    );
+                    let framed_result = Owid::read_from_prefix(&bytes);
+                    assert_eq!(
+                        ParseStatus::of(&framed_result),
+                        framed,
+                        "the framed read of these bytes should report {framed}"
+                    );
+                    assert_eq!(
+                        framed_result.is_ok(),
+                        framed == ParseStatus::Parsed,
                         "only {} may come with an OWID",
                         ParseStatus::Parsed
                     );
@@ -435,12 +476,18 @@ mod tests {
                     assert!(result.is_err(), "a failure should hand back no OWID");
                 }
                 Case::CannotBeProduced => {
-                    for bytes in [Vec::new(), vec![0], signed_envelope()] {
-                        assert_ne!(
+                    let mut trailing = signed_envelope();
+                    trailing.push(0);
+                    for bytes in [Vec::new(), vec![0], signed_envelope(), trailing] {
+                        for reported in [
                             ParseStatus::of(&Owid::from_byte_array(&bytes)),
-                            status,
-                            "{status} is documented as one this crate does not produce"
-                        );
+                            ParseStatus::of(&Owid::read_from_prefix(&bytes)),
+                        ] {
+                            assert_ne!(
+                                reported, status,
+                                "{status} is documented as one this crate does not produce"
+                            );
+                        }
                     }
                 }
             }

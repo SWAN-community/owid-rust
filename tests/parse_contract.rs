@@ -22,6 +22,11 @@
 //! cases of the shared status matrix, and the cases that prove an OWID can
 //! not exist in an unsigned state.
 //!
+//! Both reads answer to it. The whole buffer read takes a buffer holding
+//! one OWID, and the framed read takes one from the front of a buffer that
+//! carries more, which differ only in what they say about the bytes after
+//! the envelope.
+//!
 //! The two routes to an OWID are checked here as a pair. Everything a
 //! library user could do before this crate closed construction they can
 //! still do, by creating through a [`Creator`] rather than by assembling
@@ -34,6 +39,21 @@
 //! constructor ever become public again.
 
 use owid::{Creator, Crypto, Owid, ParseDetail, ParseStatus, SignatureStatus, SIGNATURE_LENGTH};
+
+/// A run of complete envelopes, one after another, as a format carrying
+/// several OWIDs holds them.
+fn run_of_envelopes(payloads: &[&str]) -> Vec<u8> {
+    let creator = creator();
+    let mut buffer = Vec::new();
+    for payload in payloads {
+        creator
+            .create(*payload)
+            .expect("should create")
+            .to_buffer(&mut buffer)
+            .expect("should serialize");
+    }
+    buffer
+}
 
 const DOMAIN: &str = "test.com";
 
@@ -321,6 +341,109 @@ fn a_key_that_cannot_be_read_is_not_an_invalid_signature() {
             owid.verify_status_with_public_key(pem, &[]),
             SignatureStatus::InvalidKey,
             "a key that cannot be read should not read as a forgery"
+        );
+    }
+}
+
+/// The framed read walks a run of envelopes, one after another, ending with
+/// nothing left over. Reading the next one needs the bytes after the last,
+/// which is what it hands back.
+#[test]
+fn the_framed_read_walks_a_run_of_envelopes() {
+    let buffer = run_of_envelopes(&["first", "second"]);
+
+    let (first, rest) = Owid::read_from_prefix(&buffer).expect("should read the first");
+    assert_eq!(first.payload_as_string(), "first");
+    assert!(
+        !rest.is_empty(),
+        "the second envelope should still be there"
+    );
+
+    let (second, rest) = Owid::read_from_prefix(rest).expect("should read the second");
+    assert_eq!(second.payload_as_string(), "second");
+    assert!(rest.is_empty(), "the run should be fully consumed");
+
+    // Both are complete OWIDs rather than fragments, so both verify.
+    for owid in [&first, &second] {
+        assert_eq!(
+            owid.signature().len(),
+            SIGNATURE_LENGTH,
+            "a framed read should produce a complete OWID"
+        );
+    }
+}
+
+/// The same run handed to the whole buffer read is refused, because there a
+/// buffer holds one OWID and nothing else could own the bytes after it.
+#[test]
+fn the_whole_buffer_read_refuses_a_run_of_envelopes() {
+    let buffer = run_of_envelopes(&["first", "second"]);
+
+    assert_refused(
+        Owid::from_byte_array(&buffer),
+        ParseStatus::ByteCountMismatch,
+    );
+}
+
+/// An envelope that stops before the end of its signature is refused by the
+/// framed read as well, because the payload and the signature both have to
+/// be present whatever follows, and nothing is consumed.
+#[test]
+fn the_framed_read_refuses_a_truncated_envelope() {
+    let complete = run_of_envelopes(&["first"]);
+    let truncated = &complete[..complete.len() - 1];
+
+    let error = Owid::read_from_prefix(truncated).expect_err("should refuse");
+    assert_eq!(
+        error.status(),
+        ParseStatus::ByteCountMismatch,
+        "a payload that cannot leave a whole signature is a mismatch"
+    );
+    assert!(
+        matches!(
+            error.detail(),
+            Some(ParseDetail::ByteCounts { declared, present }) if i64::from(declared) > present
+        ),
+        "the detail should show the declaration outrunning the bytes, got {:?}",
+        error.detail()
+    );
+
+    // Nothing was consumed, so the same buffer reads the same way again and
+    // the caller is not left part way through an envelope it could not
+    // read. Handing back the remaining bytes only on success is what makes
+    // that so.
+    assert_eq!(
+        truncated.len(),
+        complete.len() - 1,
+        "the caller's bytes are untouched"
+    );
+    assert_eq!(
+        ParseStatus::of(&Owid::read_from_prefix(truncated)),
+        ParseStatus::ByteCountMismatch,
+        "reading again should report the same thing"
+    );
+}
+
+/// Data that stops inside a field, before the declared count is read, is an
+/// unexpected end for the framed read too, so the two reads report the same
+/// reasons everywhere except for what follows a complete envelope.
+#[test]
+fn the_framed_read_reports_the_same_reasons() {
+    let complete = run_of_envelopes(&["first"]);
+    let header = 1 + DOMAIN.len() + 1;
+
+    for (bytes, expected) in [
+        (&complete[..header - 2], ParseStatus::UnexpectedEnd),
+        (&complete[..header + 2], ParseStatus::UnexpectedEnd),
+        (&complete[..0], ParseStatus::MissingInput),
+        (&[9u8, 9, 9][..], ParseStatus::UnsupportedVersion),
+    ] {
+        let result = Owid::read_from_prefix(bytes);
+        assert!(result.is_err(), "the framed read should not report success");
+        assert_eq!(
+            ParseStatus::of(&result),
+            expected,
+            "the framed read should report {expected}"
         );
     }
 }
