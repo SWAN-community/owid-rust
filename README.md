@@ -146,9 +146,11 @@ match result {
 ```
 
 Walk a buffer carrying one OWID after another. The framed read hands back
-the bytes that follow the envelope it read, which is what reading the next
-one needs, and it says nothing about them, because they may be the next
-envelope rather than rubbish.
+the bytes that follow the frame it read, which is what reading the next one
+needs, and it says nothing about them, because they may be the next frame
+rather than rubbish. A frame may also hold the one byte marker standing for
+a node that is not there, which it steps over, handing back `None` so a
+caller can tell an absent node from a malformed one.
 
 ```rust
 use owid::{Creator, Crypto, Owid};
@@ -163,16 +165,19 @@ let mut rest = buffer.as_slice();
 let mut payloads = Vec::new();
 while !rest.is_empty() {
     let (owid, remainder) = Owid::read_from_prefix(rest).unwrap();
-    payloads.push(owid.payload_as_string());
+    // None where the frame said the node is not there.
+    if let Some(owid) = owid {
+        payloads.push(owid.payload_as_string());
+    }
     rest = remainder;
 }
 assert_eq!(payloads, ["first", "second"]);
 ```
 
 The whole buffer read refuses that same buffer, because there a buffer holds
-one OWID and nothing else could own the bytes after it. That is the only
-difference between the two reads, and they report the same reasons
-otherwise.
+one OWID and nothing else could own the bytes after it. The two reads
+otherwise report the same reasons, differing in three answers, all listed
+under the data structure notes below.
 
 Create an OWID whose signature covers other OWIDs as well, as a processor
 does when adding itself to a transaction. The same others, in the same
@@ -242,7 +247,7 @@ fn responses(creator: &Creator) -> (String, String) {
 |`Crypto`|Holds the ECDSA P-256 keys. Generates key pairs, imports and exports PEM, signs and verifies byte arrays.|
 |`Configuration`|Domain and key PEM settings used to construct a `Creator`.|
 |`Version`|The OWID version byte. Version 3 is current. Versions 1 and 2 are readable for compatibility.|
-|`ParseError`, `ParseStatus`, `ParseDetail`|Why bytes are not an OWID. The status is the cross language name for the reason, and no detail ever carries any part of the input.|
+|`ParseError`, `ParseStatus`, `ParseDetail`|Why bytes are not an OWID, or are the marker for a node that is not there. The status is the cross language name for the reason, and no detail ever carries any part of the input.|
 |`SignatureStatus`|The outcome of asking whether a signature is genuine, keeping a signature that does not match apart from a check that could not be made.|
 |`Error`|Errors from creating, signing, serializing and verifying.|
 
@@ -251,7 +256,7 @@ fn responses(creator: &Creator) -> (String, String) {
 |Method|Description|
 |-|-|
 |`Owid::from_base64`, `Owid::from_byte_array`|Read an OWID from a buffer that holds one, answering with a `ParseError` where the bytes are not one. Base 64 is accepted with or without padding.|
-|`Owid::read_from_prefix`|Read one OWID from the front of a buffer carrying more after it, returning it with the bytes that follow. Consumes nothing when it fails.|
+|`Owid::read_from_prefix`|Read one frame from the front of a buffer carrying more after it, returning what it held, which is `None` for the absent node marker, with the bytes that follow. Consumes nothing when it fails.|
 |`Owid::as_base64`, `Owid::as_byte_array`|Serialize an OWID.|
 |`Owid::version`, `domain`, `date`, `payload`, `signature`|Read the fields. The byte fields come back as read only views.|
 |`Owid::payload_as_string`, `payload_as_printable`, `payload_as_base64`|The payload as UTF-8 text, hexadecimal, and base 64.|
@@ -279,13 +284,23 @@ of everything before it.
 * The deprecated version 1 date field stores a two byte big endian count of
   hours since the base date.
 * `payload_as_printable` returns zero padded lower case hexadecimal.
-* The marker `Owid::empty_to_buffer` writes is a single zero byte saying an
-  optional OWID is absent. A marker is not an OWID, so reading one as a
-  complete envelope reports `UnsupportedVersion`.
-* A whole buffer read requires the declared payload to leave exactly the
-  signature, so a byte after it is a `ByteCountMismatch`. A framed read
-  requires the payload and the signature to be present and says nothing
-  about what follows. Everything else about the two reads is the same.
+* The marker `Owid::empty_to_buffer` writes is a single zero byte saying a
+  node is not there. No OWID is handed back for one on either read, because
+  it carries no signature.
+* The two reads differ in three answers, and agree everywhere else.
+  * A whole buffer read requires the declared payload to leave exactly the
+    signature, so a byte after it is a `ByteCountMismatch`. A framed read
+    requires only that the payload and the signature are present and says
+    nothing about what follows.
+  * A frame whose declared payload runs past the bytes supplied is an
+    `UnexpectedEnd`, being data that stopped early, so a caller reading a
+    source that is still arriving can wait for more bytes rather than give
+    up. `ByteCountMismatch` is only reachable on the whole buffer read,
+    where every byte is present by definition.
+  * A framed read steps over the marker and hands back `None` with the
+    bytes after it, reporting `AbsentNode`. A whole buffer read reports
+    `AbsentNode` as well, because a marker is a meaningful thing to find
+    and not an unsupported version, but it has nothing to hand back.
 * Base 64 is accepted with or without padding. Output is always padded.
 * Signatures are deterministic (RFC 6979). Verification accepts any valid
   ECDSA P-256 signature, whether produced deterministically or with a

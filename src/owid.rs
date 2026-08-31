@@ -198,9 +198,11 @@ impl Owid {
     }
 
     /// Reads an OWID from its binary form. The buffer must hold exactly one
-    /// complete OWID, so bytes after the signature are refused. Where a
-    /// buffer carries a run of them, or an OWID followed by something else,
-    /// use [`Owid::read_from_prefix`] instead.
+    /// complete OWID, so bytes after the signature are refused, and the one
+    /// byte marker standing for a node that is not there is
+    /// [`ParseStatus::AbsentNode`] rather than an OWID. Where a buffer
+    /// carries a run of frames, or an OWID followed by something else, use
+    /// [`Owid::read_from_prefix`] instead.
     ///
     /// # Errors
     ///
@@ -222,16 +224,28 @@ impl Owid {
         parse::parse_exact(buffer)
     }
 
-    /// Reads one OWID from the front of a buffer that carries more than one
-    /// thing, returning it with the bytes that follow.
+    /// Reads one frame from the front of a buffer that carries more than
+    /// one thing, returning what it held with the bytes that follow.
     ///
     /// Use this where OWIDs arrive one after another, or where an OWID sits
     /// inside a larger format. It differs from [`Owid::from_byte_array`] in
-    /// one place, being that it requires only the declared payload and the
-    /// signature to be present and says nothing about what comes after
-    /// them, because what comes after them may be the next envelope rather
-    /// than rubbish. Everything else, including the statuses it reports, is
-    /// the same.
+    /// two places.
+    ///
+    /// It requires only the declared payload and the signature to be
+    /// present and says nothing about what comes after them, because what
+    /// comes after them may be the next frame rather than rubbish. A
+    /// declared payload running past the bytes supplied is
+    /// [`ParseStatus::UnexpectedEnd`], being data that stopped early, so a
+    /// caller reading a source that is still arriving can wait for more
+    /// bytes rather than give up.
+    ///
+    /// A frame may also hold the one byte marker standing for a node that
+    /// is not there, which this steps over, handing back `None` with the
+    /// bytes after it so the next frame can be read.
+    /// [`ParseStatus::of_frame`] names that outcome
+    /// [`ParseStatus::AbsentNode`]. No OWID is handed back for a marker,
+    /// because it carries no signature and nothing that could be mistaken
+    /// for an identifier should reach a caller.
     ///
     /// The bytes that follow are returned rather than a count of the bytes
     /// used, because reading the next envelope is what a caller does next
@@ -264,12 +278,17 @@ impl Owid {
     /// let mut payloads = Vec::new();
     /// while !rest.is_empty() {
     ///     let (owid, remainder) = Owid::read_from_prefix(rest).unwrap();
-    ///     payloads.push(owid.payload_as_string());
+    ///     // None where the frame said the node is not there.
+    ///     if let Some(owid) = owid {
+    ///         payloads.push(owid.payload_as_string());
+    ///     }
     ///     rest = remainder;
     /// }
     /// assert_eq!(payloads, ["first", "second"]);
     /// ```
-    pub fn read_from_prefix(buffer: &[u8]) -> std::result::Result<(Self, &[u8]), ParseError> {
+    pub fn read_from_prefix(
+        buffer: &[u8],
+    ) -> std::result::Result<(Option<Self>, &[u8]), ParseError> {
         parse::parse_prefix(buffer)
     }
 
@@ -309,13 +328,17 @@ impl Owid {
         io::write_signature(buffer, &self.signature)
     }
 
-    /// Writes an empty OWID marker, which is how a byte array says that an
-    /// optional OWID is not present.
+    /// Writes the one byte marker that says a node is not there, which is
+    /// how a byte array carries an optional OWID that is absent.
     ///
-    /// A marker is not an OWID, so reading one back with
-    /// [`Owid::from_byte_array`] is [`ParseStatus::UnsupportedVersion`]. A
-    /// format carrying optional OWIDs reads the marker byte itself and
-    /// calls this crate only where there is an OWID to read.
+    /// Reading a frame, [`Owid::read_from_prefix`] steps over a marker and
+    /// hands back `None` with the bytes after it, so a caller walking a run
+    /// of frames can tell a node that is absent from one that is malformed
+    /// and carry on to the next. Reading a buffer that should hold one
+    /// OWID, [`Owid::from_byte_array`] reports
+    /// [`ParseStatus::AbsentNode`], because a marker on its own is not an
+    /// identifier. No OWID is handed back for a marker either way, since it
+    /// carries no signature.
     pub fn empty_to_buffer(buffer: &mut Vec<u8>) {
         io::write_byte(buffer, Version::Empty.as_byte());
     }

@@ -427,21 +427,23 @@ fn empty_domain_rejected() {
     );
 }
 
-/// The empty marker is a single zero byte saying that an optional OWID is
-/// not present, mirroring the EmptyToBuffer functions in the .NET and Go
-/// implementations. A marker is not an OWID, so reading one as a complete
-/// envelope is refused rather than handing back an OWID with nothing in it.
+/// The empty marker is a single zero byte saying that a node is not there,
+/// mirroring the EmptyToBuffer functions in the .NET and Go
+/// implementations. A marker is not an OWID, so reading a buffer that
+/// should hold one reports it as the absent node it is rather than handing
+/// back an OWID with nothing in it.
 #[test]
-fn empty_marker_is_not_an_owid() {
+fn empty_marker_is_an_absent_node() {
     let mut buffer = Vec::new();
     Owid::empty_to_buffer(&mut buffer);
     assert_eq!(buffer, vec![0], "empty marker should be a single zero byte");
     let result = Owid::from_byte_array(&buffer);
     assert_eq!(
         ParseStatus::of(&result),
-        ParseStatus::UnsupportedVersion,
-        "a marker should not read as an OWID"
+        ParseStatus::AbsentNode,
+        "a marker should be named rather than read as an OWID"
     );
+    assert!(result.is_err(), "a marker should hand back no OWID");
 }
 
 /// Unknown version bytes are rejected.

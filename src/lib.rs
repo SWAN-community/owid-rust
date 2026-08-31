@@ -47,7 +47,16 @@
 //! than 64 bytes after the payload, is refused as malformed. Reading one
 //! from the front of a longer buffer with [`Owid::read_from_prefix`], the
 //! payload and the 64 signature bytes must be present and whatever follows
-//! them is handed back, because it may be the next envelope.
+//! them is handed back, because it may be the next frame. A payload
+//! declared longer than the bytes supplied is data that stopped early
+//! there, rather than a declaration disagreeing with bytes that are all
+//! present.
+//!
+//! A frame may instead hold the one byte marker written by
+//! [`Owid::empty_to_buffer`], which stands for a node that is not there. It
+//! is not an OWID and carries no signature, so no OWID is handed back for
+//! one, and both reads name it [`ParseStatus::AbsentNode`] so that a caller
+//! walking a run of frames can tell an absent node from a malformed one.
 //!
 //! The domain is found by reading forward to its null terminator, and that
 //! read stops at the maximum length a domain name is allowed to be, so a

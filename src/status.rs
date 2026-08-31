@@ -22,6 +22,7 @@
 use std::fmt;
 
 use crate::error::Error;
+use crate::owid::Owid;
 use crate::parse::ParseError;
 
 /// Why reading an OWID succeeded or failed.
@@ -47,13 +48,30 @@ pub enum ParseStatus {
     /// The string is not valid base 64, so there are no bytes to read.
     InvalidBase64,
     /// The first byte names a version this implementation does not know.
-    /// The empty marker written by [`crate::Owid::empty_to_buffer`] is
-    /// reported this way as well, because a marker saying an OWID is absent
-    /// is not itself an OWID.
     UnsupportedVersion,
+    /// The one byte marker written by [`crate::Owid::empty_to_buffer`],
+    /// which stands for a node that is not there.
+    ///
+    /// A marker is a meaningful thing to find rather than a fault, so a
+    /// caller walking a run of frames can tell a node that is absent from
+    /// one that is malformed. It is not an OWID, though, and it carries no
+    /// signature, so no OWID is ever handed back for one.
+    ///
+    /// Reading a frame, [`crate::Owid::read_from_prefix`] steps over the
+    /// marker and hands back the bytes after it, so the next frame can be
+    /// read. Reading a buffer that should hold one OWID,
+    /// [`crate::Owid::from_byte_array`] reports this and nothing else,
+    /// because a marker on its own is not an identifier.
+    AbsentNode,
     /// The data stopped in the middle of a field, before the declared
-    /// payload length was even read. Distinct from [`Self::ByteCountMismatch`],
-    /// which is a declaration that disagrees with the bytes that follow it.
+    /// payload length was even read, or, reading a frame, the declared
+    /// payload ran past the bytes supplied.
+    ///
+    /// Distinct from [`Self::ByteCountMismatch`], which is a declaration
+    /// disagreeing with bytes that are all present. A frame short of its
+    /// declared payload may be a source still arriving, and a caller can
+    /// wait for more bytes on this answer where it would have to give up on
+    /// the other.
     UnexpectedEnd,
     /// The creator domain has no terminator within the published maximum
     /// length of a domain name, or the bytes it holds are not valid UTF-8.
@@ -62,6 +80,13 @@ pub enum ParseStatus {
     /// present. Checked before anything is sized by the declaration, so a
     /// sender cannot make a reader reserve memory by claiming a large
     /// payload it did not send.
+    ///
+    /// Only the whole buffer read reports this, because only there are all
+    /// the bytes present by definition, so a count that does not match is a
+    /// disagreement rather than data that stopped early. A byte after the
+    /// signature is a disagreement as well, since nothing else in a buffer
+    /// holding one OWID could own it. A frame short of its declared payload
+    /// is [`Self::UnexpectedEnd`].
     ByteCountMismatch,
     /// The envelope is structurally consistent but larger than this build
     /// can hold or reserve. Not a fault in the data, and deliberately apart
@@ -94,8 +119,9 @@ impl ParseStatus {
     /// A [`Result`] already says whether the read worked and holds the OWID
     /// only when it did, so this exists for the third fact, which is the
     /// named reason, in the one place where success has no error to carry
-    /// it. It takes the outcome of either read, the framed one handing back
-    /// the remaining bytes alongside the OWID.
+    /// it. [`ParseStatus::of_frame`] answers for the framed read, which has
+    /// an outcome of its own because a frame may hold a marker standing for
+    /// a node that is not there.
     ///
     /// # Examples
     ///
@@ -112,9 +138,38 @@ impl ParseStatus {
     /// let result = Owid::from_base64("not base 64!");
     /// assert_eq!(ParseStatus::of(&result), ParseStatus::InvalidBase64);
     /// ```
-    pub fn of<T>(result: &Result<T, ParseError>) -> ParseStatus {
+    pub fn of(result: &Result<Owid, ParseError>) -> ParseStatus {
         match result {
             Ok(_) => ParseStatus::Parsed,
+            Err(e) => e.status(),
+        }
+    }
+
+    /// The status of a framed read, which is [`Self::Parsed`] when it read
+    /// an OWID, [`Self::AbsentNode`] when the frame held the marker for a
+    /// node that is not there, and the reason it did not otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use owid::{Owid, ParseStatus};
+    ///
+    /// let mut marker = Vec::new();
+    /// Owid::empty_to_buffer(&mut marker);
+    ///
+    /// let result = Owid::read_from_prefix(&marker);
+    /// assert_eq!(ParseStatus::of_frame(&result), ParseStatus::AbsentNode);
+    ///
+    /// // The marker is stepped over, so the next frame can be read, and no
+    /// // OWID is handed back for it.
+    /// let (owid, rest) = result.unwrap();
+    /// assert!(owid.is_none());
+    /// assert!(rest.is_empty());
+    /// ```
+    pub fn of_frame(result: &Result<(Option<Owid>, &[u8]), ParseError>) -> ParseStatus {
+        match result {
+            Ok((Some(_), _)) => ParseStatus::Parsed,
+            Ok((None, _)) => ParseStatus::AbsentNode,
             Err(e) => e.status(),
         }
     }
@@ -127,6 +182,7 @@ impl ParseStatus {
             ParseStatus::MissingInput => "MissingInput",
             ParseStatus::InvalidBase64 => "InvalidBase64",
             ParseStatus::UnsupportedVersion => "UnsupportedVersion",
+            ParseStatus::AbsentNode => "AbsentNode",
             ParseStatus::UnexpectedEnd => "UnexpectedEnd",
             ParseStatus::InvalidDomainEncoding => "InvalidDomainEncoding",
             ParseStatus::ByteCountMismatch => "ByteCountMismatch",
@@ -249,13 +305,13 @@ impl fmt::Display for SignatureStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owid::Owid;
 
     /// The names are the cross language vocabulary, so a status written to
     /// a log or compared across implementations reads the same everywhere.
     #[test]
     fn parse_status_names_are_the_cross_language_ones() {
         assert_eq!(ParseStatus::Parsed.to_string(), "Parsed");
+        assert_eq!(ParseStatus::AbsentNode.to_string(), "AbsentNode");
         assert_eq!(
             ParseStatus::ByteCountMismatch.to_string(),
             "ByteCountMismatch"
@@ -373,11 +429,16 @@ mod tests {
                 framed: ParseStatus::MissingInput,
             },
             ParseStatus::InvalidBase64 => Case::Text("not base 64!"),
-            // The empty marker, which says an OWID is absent, is a version
-            // this reader does not accept as an envelope.
             ParseStatus::UnsupportedVersion => Case::Bytes {
-                bytes: vec![0],
+                bytes: vec![9, 9, 9],
                 framed: ParseStatus::UnsupportedVersion,
+            },
+            // The marker standing for a node that is not there. Both reads
+            // name it, and neither hands back an OWID for it, the framed
+            // read stepping over it so the next frame can be read.
+            ParseStatus::AbsentNode => Case::Bytes {
+                bytes: vec![0],
+                framed: ParseStatus::AbsentNode,
             },
             ParseStatus::UnexpectedEnd => Case::Bytes {
                 bytes: vec![3, b'a', b'b'],
@@ -393,6 +454,11 @@ mod tests {
                     framed: ParseStatus::InvalidDomainEncoding,
                 }
             }
+            // Data that stops inside a field. A frame whose declared
+            // payload runs past the bytes supplied is an unexpected end as
+            // well, which the tests outside the crate cover, because there
+            // the difference from a byte count mismatch is the point.
+            //
             // A byte after the signature. The whole buffer read refuses it,
             // because nothing else in a buffer holding one OWID could own
             // it, and the framed read hands it back as the start of
@@ -433,6 +499,7 @@ mod tests {
             ParseStatus::MissingInput,
             ParseStatus::InvalidBase64,
             ParseStatus::UnsupportedVersion,
+            ParseStatus::AbsentNode,
             ParseStatus::UnexpectedEnd,
             ParseStatus::InvalidDomainEncoding,
             ParseStatus::ByteCountMismatch,
@@ -455,16 +522,24 @@ mod tests {
                     );
                     let framed_result = Owid::read_from_prefix(&bytes);
                     assert_eq!(
-                        ParseStatus::of(&framed_result),
+                        ParseStatus::of_frame(&framed_result),
                         framed,
                         "the framed read of these bytes should report {framed}"
                     );
                     assert_eq!(
                         framed_result.is_ok(),
-                        framed == ParseStatus::Parsed,
-                        "only {} may come with an OWID",
-                        ParseStatus::Parsed
+                        framed == ParseStatus::Parsed || framed == ParseStatus::AbsentNode,
+                        "a frame either held something or failed"
                     );
+                    if let Ok((owid, _)) = framed_result {
+                        assert_eq!(
+                            owid.is_some(),
+                            framed == ParseStatus::Parsed,
+                            "only {} comes with an OWID, and never {}",
+                            ParseStatus::Parsed,
+                            ParseStatus::AbsentNode
+                        );
+                    }
                 }
                 Case::Text(text) => {
                     let result = Owid::from_base64(text);
@@ -481,7 +556,7 @@ mod tests {
                     for bytes in [Vec::new(), vec![0], signed_envelope(), trailing] {
                         for reported in [
                             ParseStatus::of(&Owid::from_byte_array(&bytes)),
-                            ParseStatus::of(&Owid::read_from_prefix(&bytes)),
+                            ParseStatus::of_frame(&Owid::read_from_prefix(&bytes)),
                         ] {
                             assert_ne!(
                                 reported, status,

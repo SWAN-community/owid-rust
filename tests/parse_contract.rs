@@ -23,9 +23,11 @@
 //! not exist in an unsigned state.
 //!
 //! Both reads answer to it. The whole buffer read takes a buffer holding
-//! one OWID, and the framed read takes one from the front of a buffer that
-//! carries more, which differ only in what they say about the bytes after
-//! the envelope.
+//! one OWID, and the framed read takes one frame from the front of a buffer
+//! that carries more. They differ in what they say about the bytes after
+//! the envelope, in what they call a declared payload that runs past the
+//! bytes supplied, and in what they do with the marker standing for a node
+//! that is not there.
 //!
 //! The two routes to an OWID are checked here as a pair. Everything a
 //! library user could do before this crate closed construction they can
@@ -353,6 +355,7 @@ fn the_framed_read_walks_a_run_of_envelopes() {
     let buffer = run_of_envelopes(&["first", "second"]);
 
     let (first, rest) = Owid::read_from_prefix(&buffer).expect("should read the first");
+    let first = first.expect("the first frame should hold an OWID");
     assert_eq!(first.payload_as_string(), "first");
     assert!(
         !rest.is_empty(),
@@ -360,6 +363,7 @@ fn the_framed_read_walks_a_run_of_envelopes() {
     );
 
     let (second, rest) = Owid::read_from_prefix(rest).expect("should read the second");
+    let second = second.expect("the second frame should hold an OWID");
     assert_eq!(second.payload_as_string(), "second");
     assert!(rest.is_empty(), "the run should be fully consumed");
 
@@ -396,8 +400,16 @@ fn the_framed_read_refuses_a_truncated_envelope() {
     let error = Owid::read_from_prefix(truncated).expect_err("should refuse");
     assert_eq!(
         error.status(),
+        ParseStatus::UnexpectedEnd,
+        "a frame whose declared payload runs past the bytes supplied is \
+         data that stopped early, which a caller reading a source still \
+         arriving can wait on, and not a declaration disagreeing with \
+         bytes that are all present"
+    );
+    assert_ne!(
+        error.status(),
         ParseStatus::ByteCountMismatch,
-        "a payload that cannot leave a whole signature is a mismatch"
+        "a mismatch is only reachable where all the bytes are present"
     );
     assert!(
         matches!(
@@ -418,8 +430,8 @@ fn the_framed_read_refuses_a_truncated_envelope() {
         "the caller's bytes are untouched"
     );
     assert_eq!(
-        ParseStatus::of(&Owid::read_from_prefix(truncated)),
-        ParseStatus::ByteCountMismatch,
+        ParseStatus::of_frame(&Owid::read_from_prefix(truncated)),
+        ParseStatus::UnexpectedEnd,
         "reading again should report the same thing"
     );
 }
@@ -441,11 +453,59 @@ fn the_framed_read_reports_the_same_reasons() {
         let result = Owid::read_from_prefix(bytes);
         assert!(result.is_err(), "the framed read should not report success");
         assert_eq!(
-            ParseStatus::of(&result),
+            ParseStatus::of_frame(&result),
             expected,
             "the framed read should report {expected}"
         );
     }
+}
+
+/// The marker standing for a node that is not there is named by both reads,
+/// and neither hands back an OWID for it, because it carries no signature
+/// and nothing that could be taken for an identifier should reach a caller.
+#[test]
+fn the_marker_is_an_absent_node_on_both_contracts() {
+    let mut marker = Vec::new();
+    Owid::empty_to_buffer(&mut marker);
+    assert_eq!(marker, vec![0], "the marker should be a single zero byte");
+
+    // A buffer that should hold one OWID holds a marker instead, which is
+    // not an identifier, so there is nothing to hand back.
+    let result = Owid::from_byte_array(&marker);
+    assert_refused(result, ParseStatus::AbsentNode);
+
+    // A frame may hold one, which is a meaningful thing to find rather
+    // than a fault, so the read succeeds with no OWID in it.
+    let (owid, rest) = Owid::read_from_prefix(&marker).expect("a frame may hold a marker");
+    assert!(owid.is_none(), "a marker is not an OWID");
+    assert!(rest.is_empty(), "the marker byte should be stepped over");
+    assert_eq!(
+        ParseStatus::of_frame(&Owid::read_from_prefix(&marker)),
+        ParseStatus::AbsentNode,
+        "the outcome should be named"
+    );
+}
+
+/// A caller walking a run of frames can tell a node that is absent from one
+/// that is malformed, and carry on to the next frame either way. Losing
+/// that distinction is why the marker is named rather than refused.
+#[test]
+fn a_marker_is_stepped_over_to_reach_the_next_frame() {
+    let mut buffer = Vec::new();
+    Owid::empty_to_buffer(&mut buffer);
+    buffer.extend_from_slice(&run_of_envelopes(&["after the marker"]));
+
+    let (absent, rest) = Owid::read_from_prefix(&buffer).expect("should read the marker");
+    assert!(absent.is_none(), "the first frame holds no OWID");
+
+    let (owid, rest) = Owid::read_from_prefix(rest).expect("should read the envelope");
+    let owid = owid.expect("the second frame should hold an OWID");
+    assert_eq!(
+        owid.payload_as_string(),
+        "after the marker",
+        "the envelope after the marker should be read"
+    );
+    assert!(rest.is_empty(), "the run should be fully consumed");
 }
 
 /// A key that could not be obtained at all is not a signature that does not

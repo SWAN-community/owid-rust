@@ -22,13 +22,25 @@
 //! because the data comes from outside, and whoever sends it chooses how
 //! often this fails and how large each attempt is.
 //!
-//! There are two ways to read, and they differ in one comparison. The whole
-//! buffer read requires the envelope to end where the buffer does, so a byte
-//! after the signature is refused, because in a buffer holding one OWID
-//! nothing else could own that byte. The framed read requires only that the
-//! declared payload and the signature are present, and says nothing about
-//! what follows, because what follows may be the next envelope rather than
-//! rubbish.
+//! There are two ways to read. The whole buffer read requires the envelope
+//! to end where the buffer does, so a byte after the signature is refused,
+//! because in a buffer holding one OWID nothing else could own that byte.
+//! The framed read requires only that the declared payload and the
+//! signature are present, and says nothing about what follows, because what
+//! follows may be the next envelope rather than rubbish.
+//!
+//! They differ in two answers, both about the bytes after the length field.
+//! A whole buffer that declares a payload not matching what is present is a
+//! [`ParseStatus::ByteCountMismatch`], because all the bytes are there by
+//! definition and the declaration disagrees with them. A frame whose
+//! declared payload runs past what was supplied is a
+//! [`ParseStatus::UnexpectedEnd`], because the data stopped early, and a
+//! caller reading from a source still arriving can wait for more bytes on
+//! one answer and has to give up on the other.
+//!
+//! The other difference is the one byte marker standing for a node that is
+//! not there. A frame may hold one, so the framed read steps over it and
+//! carries on, while a whole buffer holding one is not an OWID at all.
 
 use std::fmt;
 
@@ -165,9 +177,18 @@ pub(crate) fn parse_exact(buffer: &[u8]) -> Result<Owid, ParseError> {
 /// Nothing is consumed when this fails, because the buffer is borrowed and
 /// the bytes that follow are handed back only on success, so a caller can
 /// never be left part way through an envelope it could not read.
-pub(crate) fn parse_prefix(buffer: &[u8]) -> Result<(Owid, &[u8]), ParseError> {
+pub(crate) fn parse_prefix(buffer: &[u8]) -> Result<(Option<Owid>, &[u8]), ParseError> {
+    if buffer.is_empty() {
+        return fail(ParseStatus::MissingInput);
+    }
+    // A frame may say that the node it holds is not there. The marker is
+    // one byte and carries no signature, so there is no OWID to hand back,
+    // and stepping over it is what lets a caller reach the next frame.
+    if buffer[0] == Version::Empty.as_byte() {
+        return Ok((None, &buffer[1..]));
+    }
     let (owid, used) = parse_one(buffer, Extent::Prefix)?;
-    Ok((owid, &buffer[used..]))
+    Ok((Some(owid), &buffer[used..]))
 }
 
 /// Reads one envelope from the front of the buffer, returning it with the
@@ -182,10 +203,12 @@ fn parse_one(buffer: &[u8], extent: Extent) -> Result<(Owid, usize), ParseError>
     let total = buffer.len();
 
     // The version decides the width of the date field, so it is read
-    // first. The empty marker, version zero, says an OWID is absent, and a
-    // marker is not itself an OWID.
+    // first. Version zero is the marker saying a node is not there, which
+    // is a meaningful thing to find and not an unsupported version, but it
+    // is not an OWID either, so nothing is handed back for it.
     let version = match Version::try_from(buffer[0]) {
-        Ok(Version::Empty) | Err(_) => {
+        Ok(Version::Empty) => return fail(ParseStatus::AbsentNode),
+        Err(_) => {
             return fail_with(
                 ParseStatus::UnsupportedVersion,
                 ParseDetail::VersionByte(buffer[0]),
@@ -217,26 +240,30 @@ fn parse_one(buffer: &[u8], extent: Extent) -> Result<(Owid, usize), ParseError>
     // rather than wrapping, and a negative number can never equal a
     // declaration.
     //
-    // The disagreement is the finding even when the buffer also stopped
-    // early. What a reader can say for certain is that the declared
-    // payload cannot leave the signature the version requires, and that is
-    // true whichever way the bytes fall short.
+    // This comparison is where the two reads differ, and so are their
+    // answers.
     //
-    // This comparison is the one place the two reads differ. A whole
-    // buffer holds one OWID, so the count has to match exactly and a byte
-    // after the signature is a disagreement. A framed read only needs the
-    // payload and the signature to be there, because the bytes after them
-    // belong to whoever reads the next envelope.
+    // A whole buffer holds one OWID and every byte of it, so a count that
+    // does not match exactly is a declaration disagreeing with data that is
+    // all present, which is a mismatch whichever way the bytes fall short,
+    // a byte after the signature included.
+    //
+    // A frame may be part of a source still arriving, so a declared payload
+    // running past what was supplied is data that stopped early rather than
+    // a disagreement, and the difference matters to a caller deciding
+    // whether to wait for more bytes or give up. Bytes beyond the payload
+    // and signature are not judged at all, because they belong to whoever
+    // reads the next frame.
     let present = (total - at) as i64 - SIGNATURE_LENGTH as i64;
-    let enough = match extent {
-        Extent::WholeBuffer => present == i64::from(declared),
-        Extent::Prefix => present >= i64::from(declared),
-    };
-    if !enough {
-        return fail_with(
-            ParseStatus::ByteCountMismatch,
-            ParseDetail::ByteCounts { declared, present },
-        );
+    let counts = ParseDetail::ByteCounts { declared, present };
+    match extent {
+        Extent::WholeBuffer if present != i64::from(declared) => {
+            return fail_with(ParseStatus::ByteCountMismatch, counts)
+        }
+        Extent::Prefix if present < i64::from(declared) => {
+            return fail_with(ParseStatus::UnexpectedEnd, counts)
+        }
+        _ => {}
     }
 
     // The bytes are all here. Whether this build can hold them is a
