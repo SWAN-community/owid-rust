@@ -77,6 +77,44 @@ fn envelope(declared: u32, payload: &[u8], signature: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// A version 3 envelope carrying the given minute count, so a test can put
+/// a date on the wire that no creator would write. The signature is not
+/// checked by a read, so zeros serve.
+fn envelope_dated(minutes: u32) -> Vec<u8> {
+    let mut bytes = vec![3u8];
+    bytes.extend_from_slice(DOMAIN.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&minutes.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(7);
+    bytes.extend_from_slice(&[0u8; SIGNATURE_LENGTH]);
+    bytes
+}
+
+/// A version 1 envelope carrying the given hour count, built by hand because
+/// no creator writes that version any more. Two big endian bytes of hours.
+fn envelope_version1(hours: u16) -> Vec<u8> {
+    let mut bytes = vec![1u8];
+    bytes.extend_from_slice(DOMAIN.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&hours.to_be_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(7);
+    bytes.extend_from_slice(&[0u8; SIGNATURE_LENGTH]);
+    bytes
+}
+
+/// Reads the envelope on both contracts, asserts both succeed and agree on
+/// the date, and hands the date back.
+fn date_on_both_contracts(bytes: &[u8]) -> chrono::DateTime<chrono::Utc> {
+    let whole = Owid::from_byte_array(bytes).expect("the whole buffer read should succeed");
+    let (framed, rest) = Owid::read_from_prefix(bytes).expect("the framed read should succeed");
+    let framed = framed.expect("a frame carrying an OWID");
+    assert!(rest.is_empty(), "the frame should occupy the whole buffer");
+    assert_eq!(whole.date(), framed.date(), "both reads should agree");
+    whole.date()
+}
+
 /// Asserts everything a failed read must report, being that it did not
 /// work, that no OWID came back, and that the reason is the one expected.
 /// Nothing here can panic on the crate's behalf, so reaching the assertions
@@ -613,4 +651,51 @@ fn returned_bytes_are_a_view_of_the_owid() {
         "Hello World",
         "the OWID should still carry what it was created with"
     );
+}
+
+/// The largest date the wire can carry is inside what chrono can hold, so
+/// the read succeeds and no guard is needed here.
+///
+/// Versions 2 and 3 carry the date as an unsigned 32 bit count of minutes
+/// since 2020-01-01, which runs to 4,294,967,295 and lands on 15 February
+/// 10186. Runtimes whose date type stops at the year 9999 (.NET and Python)
+/// cannot represent that and report `ImplementationCapacityExceeded`
+/// before the arithmetic, while chrono's `NaiveDate::MAX` is the end of the
+/// year 262142. This test proves the claim against the chrono this crate
+/// builds with, on both contracts, rather than leaving it as a comment.
+#[test]
+fn maximum_date_count_parses_on_both_contracts() {
+    use chrono::{Datelike, TimeZone};
+    assert!(
+        chrono::NaiveDate::MAX.year() > 10186,
+        "chrono's range has shrunk, and a guard is needed now"
+    );
+    let expected = chrono::Utc
+        .with_ymd_and_hms(10186, 2, 15, 4, 15, 0)
+        .single()
+        .expect("a date chrono can hold");
+
+    let date = date_on_both_contracts(&envelope_dated(u32::MAX));
+
+    assert_eq!(
+        date, expected,
+        "the maximum count should land on 10186-02-15 04:15"
+    );
+}
+
+/// Version 1 counts hours in two bytes, so its largest count is 65,535
+/// hours, which is 23 June 2027 and under eight years from the base date.
+/// No runtime can fail on that, so no port guards it, and this shows none is
+/// needed.
+#[test]
+fn version1_maximum_hours_parses_on_both_contracts() {
+    use chrono::TimeZone;
+    let expected = chrono::Utc
+        .with_ymd_and_hms(2027, 6, 23, 15, 0, 0)
+        .single()
+        .expect("a date chrono can hold");
+
+    let date = date_on_both_contracts(&envelope_version1(u16::MAX));
+
+    assert_eq!(date, expected);
 }
