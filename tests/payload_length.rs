@@ -201,7 +201,7 @@ fn library_output_parses() {
 /// One more or one fewer than the bytes present is refused, because either
 /// leaves something other than exactly the signature at the end. The
 /// failure names the declared count and the count present so the reader of
-/// a log can see which one is wrong, and neither is any part of the input.
+/// a log can see which one is wrong, and neither is text from the input.
 #[test]
 fn declared_length_off_by_one_is_refused() {
     let payload = payload();

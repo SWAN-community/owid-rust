@@ -247,8 +247,10 @@ fn standard_conversions_report_the_same_reasons() {
     assert_eq!(error.status(), ParseStatus::UnsupportedVersion);
 }
 
-/// A failure never carries any part of the input, so logging one cannot
-/// log whatever an untrusted sender chose to put in it.
+/// A failure never carries the domain, the payload or any other text from
+/// the input, so logging one cannot log what an untrusted sender chose to
+/// put in it. The only byte of the input a detail names is the version that
+/// was not recognised, which is one number out of a fixed range.
 #[test]
 fn a_failure_never_repeats_the_input() {
     let secret = "SECRETVALUE";

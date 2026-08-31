@@ -54,8 +54,10 @@ use crate::SIGNATURE_LENGTH;
 
 /// What is known about a failure beyond the status that names it.
 ///
-/// None of these carry any part of the input, so logging a parse failure
-/// cannot log whatever an untrusted sender chose to put in it.
+/// These carry counts, a fixed field name and the one version byte that was
+/// not recognised, and nothing else from the input, so logging a parse
+/// failure cannot log the domain, the payload or any other text an untrusted
+/// sender chose to put in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ParseDetail {
@@ -127,7 +129,7 @@ impl ParseError {
     }
 
     /// What is known about the failure beyond the status, where anything
-    /// is. Never any part of the input.
+    /// is. Never the domain, the payload or any other text from the input.
     pub fn detail(&self) -> Option<ParseDetail> {
         self.detail
     }

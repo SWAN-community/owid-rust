@@ -138,7 +138,7 @@ match result {
     Ok(owid) => println!("read an OWID created by {}", owid.domain()),
     Err(error) => {
         // The reason is a named status, so nothing has to match on message
-        // text, and no detail ever carries any part of the input.
+        // text, and no detail ever carries text from the input.
         assert_eq!(error.status(), ParseStatus::InvalidBase64);
         println!("not an OWID because {error}");
     }
@@ -247,7 +247,7 @@ fn responses(creator: &Creator) -> (String, String) {
 |`Crypto`|Holds the ECDSA P-256 keys. Generates key pairs, imports and exports PEM, signs and verifies byte arrays.|
 |`Configuration`|Domain and key PEM settings used to construct a `Creator`.|
 |`Version`|The OWID version byte. Version 3 is current. Versions 1 and 2 are readable for compatibility.|
-|`ParseError`, `ParseStatus`, `ParseDetail`|Why bytes are not an OWID, or are the marker for a node that is not there. The status is the cross language name for the reason, and no detail ever carries any part of the input.|
+|`ParseError`, `ParseStatus`, `ParseDetail`|Why bytes are not an OWID, or are the marker for a node that is not there. The status is the cross language name for the reason. A detail carries counts, a fixed field name and the one version byte that was not recognised, so a log never receives the domain, the payload or any other text the sender chose.|
 |`SignatureStatus`|The outcome of asking whether a signature is genuine, keeping a signature that does not match apart from a check that could not be made.|
 |`Error`|Errors from creating, signing, serializing and verifying.|
 
@@ -258,6 +258,7 @@ fn responses(creator: &Creator) -> (String, String) {
 |`Owid::from_base64`, `Owid::from_byte_array`|Read an OWID from a buffer that holds one, answering with a `ParseError` where the bytes are not one. Base 64 is accepted with or without padding.|
 |`Owid::read_from_prefix`|Read one frame from the front of a buffer carrying more after it, returning what it held, which is `None` for the absent node marker, with the bytes that follow. Consumes nothing when it fails.|
 |`Owid::as_base64`, `Owid::as_byte_array`|Serialize an OWID.|
+|`Owid::to_buffer`, `Owid::empty_to_buffer`|Append an OWID, or the one byte marker for a node that is not there, to a buffer that carries a run of frames.|
 |`Owid::version`, `domain`, `date`, `payload`, `signature`|Read the fields. The byte fields come back as read only views.|
 |`Owid::payload_as_string`, `payload_as_printable`, `payload_as_base64`|The payload as UTF-8 text, hexadecimal, and base 64.|
 |`Owid::age_minutes`|Complete minutes elapsed since creation.|
