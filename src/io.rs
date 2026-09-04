@@ -49,6 +49,18 @@ pub(crate) fn base_date() -> DateTime<Utc> {
         .expect("should construct 2020-01-01T00:00:00Z")
 }
 
+/// The count of whole minutes from [`base_date`] to the date given, which
+/// is both how a date is written into an OWID from version 2 onwards and
+/// how the public key end point names the key that was in force then.
+///
+/// `None` where the date is before the base date or further ahead than the
+/// count can reach. No OWID this crate reads carries such a date, because
+/// the count it is read from is an unsigned 32 bit value, so the only way
+/// to hold one is to construct the date some other way.
+pub(crate) fn minutes_since_base(date: &DateTime<Utc>) -> Option<u32> {
+    u32::try_from((*date - base_date()).num_minutes()).ok()
+}
+
 pub(crate) fn write_byte(buffer: &mut Vec<u8>, value: u8) {
     buffer.push(value);
 }
@@ -117,8 +129,7 @@ pub(crate) fn write_date(
             Ok(())
         }
         Version::Version2 | Version::Version3 => {
-            let minutes = (*date - base_date()).num_minutes();
-            let minutes = u32::try_from(minutes).map_err(|_| Error::DateOutOfRange)?;
+            let minutes = minutes_since_base(date).ok_or(Error::DateOutOfRange)?;
             write_u32(buffer, minutes);
             Ok(())
         }

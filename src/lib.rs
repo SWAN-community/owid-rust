@@ -124,7 +124,9 @@
 //! targets such as `wasm32-wasip1`.
 //!
 //! - `fetch` adds [`Owid::verify`] which retrieves the creator public key
-//!   over HTTP from the well known end point and caches it.
+//!   over HTTP from the well known end point and caches it. The request
+//!   names the date the OWID was created, so a creator that rotates its
+//!   key returns the key that was in force then.
 //! - `endpoints` adds helpers for hosting the well known end points required
 //!   of an OWID creator.
 
