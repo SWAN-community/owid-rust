@@ -210,9 +210,14 @@ mod tests {
 
     /// A stand in for the creator public key end point, answering the way the
     /// cloud controller does. A request naming a date is served the key that
-    /// was in force then, a request without one is served the newest key in
-    /// the schedule, which is what the current key means, and a date the
-    /// schedule does not reach is a 404.
+    /// was in force then, a request without one is served the key in force at
+    /// the moment of the request, a date in the future is read as that
+    /// moment, and a date the schedule does not reach is a 404.
+    ///
+    /// The moment of the request is fixed at [`request_moment`] so the tests
+    /// are repeatable. It sits a week after the fixture identifier was
+    /// signed, so an undated request is served a key other than the one that
+    /// signed it, exactly as it would be against the live creator a week on.
     ///
     /// It records the date parameter of every request, so a test can say what
     /// went over the wire rather than only what the URL builder returned.
@@ -262,14 +267,15 @@ mod tests {
                     seen.lock()
                         .expect("should lock the record of requests")
                         .push(date.clone());
-                    let key = match date {
-                        None => schedule.last(),
+                    let asked = match date {
+                        None => request_moment(),
                         Some(minutes) => {
                             let minutes: i64 =
                                 minutes.parse().expect("the date should be a number");
-                            key_in_force(&schedule, base_date() + Duration::minutes(minutes))
+                            (base_date() + Duration::minutes(minutes)).min(request_moment())
                         }
                     };
+                    let key = key_in_force(&schedule, asked);
                     let response = match key {
                         Some(key) => format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: \
@@ -307,6 +313,14 @@ mod tests {
                 .1;
             format!("{}{}", self.base, path)
         }
+    }
+
+    /// The moment the stand in end point treats as now, a week after the
+    /// fixture identifier was signed. See [`KeyServer`].
+    fn request_moment() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-14T00:00:00Z")
+            .expect("should read the request moment")
+            .with_timezone(&Utc)
     }
 
     /// The value of a query parameter in a request target, or `None` where
@@ -367,17 +381,22 @@ mod tests {
         );
     }
 
-    /// The newest key in the schedule does not verify it, which is the whole
-    /// reason the date has to be sent. Keys rotate weekly, so the key that is
-    /// current when an identifier is checked is not the key that signed it
+    /// The key in force a week later does not verify it, which is the whole
+    /// reason the date has to be sent. Keys rotate weekly, so the key in
+    /// force when an identifier is checked is not the key that signed it
     /// unless the check happens in the same week.
     #[test]
-    fn the_current_key_does_not_verify_an_earlier_weeks_identifier() {
+    fn a_later_weeks_key_does_not_verify_an_earlier_weeks_identifier() {
         let owid = identifier();
         let schedule = schedule();
-        let current = schedule.last().expect("the schedule holds keys");
+        let later = key_in_force(&schedule, request_moment())
+            .expect("the schedule covers the moment of the request");
+        assert!(
+            later.starts_at > owid.date(),
+            "the key in force a week later starts after the identifier"
+        );
         assert_eq!(
-            owid.verify_status_with_public_key(&current.pem, &[]),
+            owid.verify_status_with_public_key(&later.pem, &[]),
             SignatureStatus::Invalid,
             "a later week's key should not verify an earlier week's identifier"
         );
@@ -405,7 +424,8 @@ mod tests {
 
     /// The same identifier against the same end point without the date, which
     /// is the request this crate made before the fix. The end point answers
-    /// with its current key, the signature does not match it, and a genuine
+    /// with the key in force at the moment of the request, a week after the
+    /// identifier was signed, the signature does not match it, and a genuine
     /// identifier reads as a forgery.
     #[test]
     fn undated_fetch_leaves_an_earlier_weeks_identifier_unverified() {
@@ -419,7 +439,7 @@ mod tests {
         assert_eq!(
             SignatureStatus::of(owid.verify_at_url(&undated, &[])),
             SignatureStatus::Invalid,
-            "an undated request gets the current key, which did not sign it"
+            "an undated request gets the key in force at the request, which did not sign it"
         );
         assert_eq!(
             server.dates(),
