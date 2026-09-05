@@ -30,6 +30,16 @@ use crate::io::minutes_since_base;
 use crate::owid::Owid;
 use crate::status::SignatureStatus;
 
+/// The most keys held before the cache is emptied and filled again. The key
+/// is the whole URL, which carries the identifier's date, so a verifier that
+/// sees many creators and many periods would otherwise grow the cache for as
+/// long as the process runs.
+const MAXIMUM_CACHED_KEYS: usize = 1024;
+
+/// How long a key fetch may take before it is reported as a key that could
+/// not be obtained rather than left hanging.
+const KEY_FETCH_TIMEOUT_SECONDS: u64 = 10;
+
 /// Cache used to avoid repeat requests for the same public keys.
 fn cache() -> &'static Mutex<HashMap<String, String>> {
     static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -44,9 +54,9 @@ fn cache() -> &'static Mutex<HashMap<String, String>> {
 /// the key that was in force when this OWID was signed. Creators rotate
 /// weekly, so without the date only identifiers created since the most
 /// recent rotation can be verified, and every older one is reported as not
-/// matching. A creator that does not support the dated lookup ignores the
-/// parameter and returns its current key, which is what an undated request
-/// would have received anyway.
+/// matching. A creator that ignores the parameter returns its current key,
+/// so every identifier it signed under an earlier key reads as not matching.
+/// A creator that rotates its key therefore has to honour the date.
 ///
 /// The date is left out where it cannot be counted, which no OWID read by
 /// this crate can be. See [`crate::io::minutes_since_base`].
@@ -72,15 +82,19 @@ fn public_key_pem(url: &str) -> Result<String> {
     {
         return Ok(pem.clone());
     }
-    let pem = ureq::get(url)
+    let pem = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(KEY_FETCH_TIMEOUT_SECONDS))
+        .build()
+        .get(url)
         .call()
         .map_err(|e| Error::Http(e.to_string()))?
         .into_string()
         .map_err(|e| Error::Http(e.to_string()))?;
-    cache()
-        .lock()
-        .expect("should lock the public key cache")
-        .insert(url.to_owned(), pem.clone());
+    let mut held = cache().lock().expect("should lock the public key cache");
+    if held.len() >= MAXIMUM_CACHED_KEYS {
+        held.clear();
+    }
+    held.insert(url.to_owned(), pem.clone());
     Ok(pem)
 }
 
@@ -215,9 +229,9 @@ mod tests {
     /// moment, and a date the schedule does not reach is a 404.
     ///
     /// The moment of the request is fixed at [`request_moment`] so the tests
-    /// are repeatable. It sits a week after the fixture identifier was
+    /// are repeatable. It sits ten days after the fixture identifier was
     /// signed, so an undated request is served a key other than the one that
-    /// signed it, exactly as it would be against the live creator a week on.
+    /// signed it, exactly as it would be against the live creator in the week that followed.
     ///
     /// It records the date parameter of every request, so a test can say what
     /// went over the wire rather than only what the URL builder returned.
@@ -267,25 +281,32 @@ mod tests {
                     seen.lock()
                         .expect("should lock the record of requests")
                         .push(date.clone());
+                    // A date that is not a number is refused, as the cloud
+                    // refuses it, rather than taking the listener down.
                     let asked = match date {
-                        None => request_moment(),
-                        Some(minutes) => {
-                            let minutes: i64 =
-                                minutes.parse().expect("the date should be a number");
+                        None => Some(request_moment()),
+                        Some(minutes) => minutes.parse::<i64>().ok().map(|minutes| {
                             (base_date() + Duration::minutes(minutes)).min(request_moment())
-                        }
+                        }),
                     };
-                    let key = key_in_force(&schedule, asked);
-                    let response = match key {
-                        Some(key) => format!(
+                    let key = asked.and_then(|at| key_in_force(&schedule, at));
+                    let response = match (asked, key) {
+                        (None, _) => {
+                            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: \
+                                      close\r\n\r\n"
+                                .to_owned()
+                        }
+                        (Some(_), Some(key)) => format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: \
                              {}\r\nConnection: close\r\n\r\n{}",
                             key.pem.len(),
                             key.pem
                         ),
-                        None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: \
-                                 close\r\n\r\n"
-                            .to_owned(),
+                        (Some(_), None) => {
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: \
+                                            close\r\n\r\n"
+                                .to_owned()
+                        }
                     };
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
@@ -315,7 +336,7 @@ mod tests {
         }
     }
 
-    /// The moment the stand in end point treats as now, a week after the
+    /// The moment the stand in end point treats as now, ten days after the
     /// fixture identifier was signed. See [`KeyServer`].
     fn request_moment() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-09-14T00:00:00Z")
@@ -381,7 +402,7 @@ mod tests {
         );
     }
 
-    /// The key in force a week later does not verify it, which is the whole
+    /// The key in force in the following week does not verify it, which is the whole
     /// reason the date has to be sent. Keys rotate weekly, so the key in
     /// force when an identifier is checked is not the key that signed it
     /// unless the check happens in the same week.
@@ -393,7 +414,7 @@ mod tests {
             .expect("the schedule covers the moment of the request");
         assert!(
             later.starts_at > owid.date(),
-            "the key in force a week later starts after the identifier"
+            "the key in force in the following week starts after the identifier"
         );
         assert_eq!(
             owid.verify_status_with_public_key(&later.pem, &[]),
@@ -424,7 +445,7 @@ mod tests {
 
     /// The same identifier against the same end point without the date, which
     /// is the request this crate made before the fix. The end point answers
-    /// with the key in force at the moment of the request, a week after the
+    /// with the key in force at the moment of the request, ten days after the
     /// identifier was signed, the signature does not match it, and a genuine
     /// identifier reads as a forgery.
     #[test]

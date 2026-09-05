@@ -211,9 +211,12 @@ The request carries the OWID's own date, counted in whole minutes from
 2020-01-01, so a creator that rotates its key returns the key that was in
 force when the OWID was signed rather than whichever key is current. Creators
 commonly rotate weekly, so an undated request can only verify identifiers
-signed since the most recent rotation. A creator that does not support the
-dated lookup ignores the parameter and returns its current key, which is what
-an undated request would have received anyway.
+signed since the most recent rotation. A creator that ignores the parameter
+returns its current key, so every identifier it signed under an earlier key
+reads as not matching, which is why a creator that rotates its key has to
+honour the date. Keys are held against the URL they came from, which names
+the domain, the version and the minute, up to 1024 of them before the cache
+is emptied, and a fetch waits at most ten seconds.
 
 ```text
 GET https://[domain]/owid/api/v3/public-key?date=3510720&format=pkcs
