@@ -140,7 +140,12 @@ mod tests {
     use super::*;
     use crate::creator::Creator;
     use crate::crypto::Crypto;
-    use crate::io::{base_date, minutes_since_base};
+    use crate::io::{
+        base_date, minutes_since_base, write_byte, write_byte_array, write_date, write_domain,
+        write_signature,
+    };
+    use crate::version::Version;
+    use crate::SIGNATURE_LENGTH;
     use chrono::{DateTime, Duration, Utc};
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
@@ -367,6 +372,77 @@ mod tests {
             public_key_url(&owid, "https"),
             format!("https://example.com/owid/api/v3/public-key?date={minutes}&format=pkcs"),
             "should build the well known end point URL with the date"
+        );
+    }
+
+    /// An identifier with the version, domain and date given and a signature
+    /// of zeroes, for the cases that are about the URL rather than the
+    /// signature. Reading it back is the only way an identifier reaches a
+    /// caller, so the bytes are written and then parsed.
+    fn crafted(version: Version, domain: &str, minutes: u32) -> Owid {
+        let mut buffer = Vec::new();
+        write_byte(&mut buffer, version.as_byte());
+        write_domain(&mut buffer, domain).expect("should write the domain");
+        write_date(
+            &mut buffer,
+            &(base_date() + Duration::minutes(i64::from(minutes))),
+            version,
+        )
+        .expect("should write the date");
+        write_byte_array(&mut buffer, &[]).expect("should write the payload");
+        write_signature(&mut buffer, &[0u8; SIGNATURE_LENGTH]).expect("should write the signature");
+        Owid::from_byte_array(&buffer).expect("should read the crafted identifier")
+    }
+
+    /// The version segment is the identifier's own version byte, so a
+    /// version 2 identifier asks the version 2 end point. Nothing else in
+    /// this suite carries a version other than 3, so this is the test that
+    /// catches a constant put back into the path.
+    #[test]
+    fn url_names_the_version_the_identifier_carries() {
+        let owid = crafted(Version::Version2, "example.com", IDENTIFIER_MINUTES);
+        assert_eq!(
+            owid.version().as_byte(),
+            2,
+            "the crafted identifier is version 2"
+        );
+        assert_eq!(
+            public_key_url(&owid, "https"),
+            format!(
+                "https://example.com/owid/api/v2/public-key?date={IDENTIFIER_MINUTES}&format=pkcs"
+            ),
+            "should ask the version 2 end point"
+        );
+    }
+
+    /// Keys are held against the URL they came from, which names the
+    /// minute, so two identifiers from different weeks fetch two different
+    /// keys, and a key held for one week never answers for another.
+    #[test]
+    fn keys_are_held_per_request_and_not_per_domain() {
+        let server = KeyServer::start();
+        let earlier = crafted(
+            Version::Version3,
+            "51d.es",
+            IDENTIFIER_MINUTES - 14 * 24 * 60,
+        );
+        let later = crafted(Version::Version3, "51d.es", IDENTIFIER_MINUTES);
+        let first =
+            public_key_pem(&server.url_for(&earlier)).expect("should fetch the earlier week's key");
+        let second =
+            public_key_pem(&server.url_for(&later)).expect("should fetch the later week's key");
+        assert_ne!(first, second, "two weeks, two keys");
+        assert_eq!(server.dates().len(), 2, "one request per week");
+        let again =
+            public_key_pem(&server.url_for(&earlier)).expect("should answer from what is held");
+        assert_eq!(
+            again, first,
+            "the held key is the one fetched for that week"
+        );
+        assert_eq!(
+            server.dates().len(),
+            2,
+            "a week already held is not asked for again"
         );
     }
 
