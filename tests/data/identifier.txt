@@ -1,0 +1,4 @@
+# The genuine 51Did creator context identifier used by the dated public key
+# fetch tests. It was created on 2026-09-04 by cloud.51degrees.com for the
+# creator domain 51d.es. It is public and carries no secret.
+AzUxZC5lcwDAkTUAOAAAAAFkcBNhYL0rPISwcMhuxl0ezIe0Nywzr/lhMtzX5QjydfVQA40Aw6iylkIfGYQWecrhzDfF8g11B1KtuOBxa98MEyJZOXw3PB/EBuyOfGxZ/pu6rlt8zpCyIn1Prbu7V300bQBqrqyYfU0nNeZf/PCwLtXJRak76A==
