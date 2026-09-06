@@ -60,9 +60,10 @@ pub enum Error {
     /// The format parameter for the public key end point was not one of the
     /// valid values "spki" or "pkcs".
     InvalidKeyFormat(String),
-    /// An HTTP request to a well known end point failed. The string contains
-    /// the underlying error message. Only returned when the `fetch` feature
-    /// is enabled.
+    /// An HTTP request to a well known end point failed, or was answered
+    /// without the key. The string contains the underlying error message.
+    /// Only returned when the `fetch` feature is enabled, by the transport
+    /// that made the request or by this crate reading the answer.
     Http(String),
     /// Bytes offered to be read were not an OWID.
     ///

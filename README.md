@@ -18,10 +18,16 @@ deprecated earlier versions of the data structure.
 
 The core crate performs no network access and compiles for WebAssembly
 targets such as `wasm32-wasip1`, which makes it suitable for edge computing
-environments. Two optional features extend it.
+environments. Three optional features extend it.
 
 * `fetch` adds domain based verification that retrieves the creator public
-  key over HTTP from the well known end point and caches it.
+  key from the well known end point through a transport the caller supplies,
+  and caches it. The fetch is asynchronous, needs no particular runtime and
+  does not require a `Send` future, and the feature adds no dependency, so
+  it builds for WebAssembly targets where the host provides HTTP.
+* `reqwest-fetch` adds a ready made transport over asynchronous reqwest with
+  rustls, which never follows a redirect, for hosts that have no HTTP of
+  their own.
 * `endpoints` adds framework agnostic helpers for hosting the well known end
   points that an OWID creator must serve.
 
@@ -99,7 +105,15 @@ Enable the optional features as needed.
 
 ```toml
 [dependencies]
-owid = { version = "2", features = ["fetch", "endpoints"] }
+owid = { version = "2", features = ["reqwest-fetch", "endpoints"] }
+```
+
+Enable `fetch` on its own where the host provides HTTP, as it does on
+`wasm32-wasip1`, and supply the transport.
+
+```toml
+[dependencies]
+owid = { version = "2", features = ["fetch"] }
 ```
 
 ## Usage
@@ -204,8 +218,9 @@ assert_eq!(
 ```
 
 Verify an OWID by fetching the creator public key from the well known end
-point. Requires the `fetch` feature. A key that cannot be fetched or read is
-never reported as a signature that does not match.
+point. Requires the `fetch` feature and a transport that implements
+`PublicKeyFetch`. A key that cannot be fetched or read is never reported as
+a signature that does not match.
 
 The request carries the OWID's own date, counted in whole minutes from
 2020-01-01, so a creator that rotates its key returns the key that was in
@@ -216,21 +231,55 @@ returns its current key, so every identifier it signed under an earlier key
 reads as not matching, which is why a creator that rotates its key has to
 honour the date. Keys are held against the URL they came from, which names
 the domain, the version and the minute, up to 1024 of them before the cache
-is emptied, and a fetch waits at most ten seconds.
+is emptied, and a caller that asks for a key while another caller is
+fetching it waits for that fetch rather than starting a second.
 
 ```text
 GET https://[domain]/owid/api/v3/public-key?date=3510720&format=pkcs
 ```
 
-```rust
-use owid::{Owid, SignatureStatus};
+Only a 200 is taken as the key. A redirect is never followed, because a key
+from wherever a redirect points is not the creator's key, so the crate reads
+any 3xx as the key being unavailable and a transport must hand the redirect
+back rather than follow it. The `reqwest-fetch` feature provides
+`ReqwestFetch`, which refuses redirects on its own account as well and waits
+at most ten seconds for an answer. It holds a connection pool, so build one
+and share it.
 
-fn check(encoded: &str) -> SignatureStatus {
+```rust
+use owid::{Owid, PublicKeyFetch, ReqwestFetch, SignatureStatus};
+
+async fn check(fetch: &dyn PublicKeyFetch, encoded: &str) -> SignatureStatus {
     match Owid::from_base64(encoded) {
-        Ok(owid) => owid.verify_status("https", &[]),
+        Ok(owid) => owid.verify_status(fetch, "https", &[]).await,
         Err(_) => SignatureStatus::VerificationError,
     }
 }
+
+let fetch = ReqwestFetch::new().unwrap();
+```
+
+Where the host provides HTTP, implement the transport over it. The future
+it answers with is boxed and is not required to be `Send`, so a transport
+tied to one thread works, and no async runtime is needed beyond whatever
+drives the host.
+
+```rust
+use owid::{FetchResponse, LocalBoxFuture, PublicKeyFetch, Result};
+
+struct HostFetch;
+
+impl PublicKeyFetch for HostFetch {
+    fn fetch<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Result<FetchResponse>> {
+        Box::pin(async move {
+            // Make the request without following a redirect, and hand back
+            // the status and the body as they were answered.
+            let (status, body) = host_get(url).await?;
+            Ok(FetchResponse { status, body })
+        })
+    }
+}
+# async fn host_get(_url: &str) -> Result<(u16, String)> { Ok((404, String::new())) }
 ```
 
 Host the well known end points with any HTTP framework. Requires the
@@ -265,6 +314,8 @@ fn responses(creator: &Creator) -> (String, String) {
 |`ParseError`, `ParseStatus`, `ParseDetail`|Why bytes are not an OWID, or are the marker for a node that is not there. The status is the cross language name for the reason. A detail carries counts, a fixed field name and the one version byte that was not recognised, so a log never receives the domain, the payload or any other text the sender chose.|
 |`SignatureStatus`|The outcome of asking whether a signature is genuine, keeping a signature that does not match apart from a check that could not be made.|
 |`Error`|Errors from creating, signing, serializing and verifying.|
+|`PublicKeyFetch`, `FetchResponse`, `LocalBoxFuture`|The transport that makes the public key request for `Owid::verify`, what it hands back, and the boxed future it answers with, which is not required to be `Send` (`fetch` feature).|
+|`ReqwestFetch`|The ready made transport over asynchronous reqwest with rustls, which never follows a redirect (`reqwest-fetch` feature).|
 
 ### Methods
 
@@ -279,7 +330,7 @@ fn responses(creator: &Creator) -> (String, String) {
 |`Owid::age_minutes`|Complete minutes elapsed since creation.|
 |`Owid::verify_with_crypto`, `verify_with_public_key`|Verify the signature, optionally with the other OWIDs that were signed together.|
 |`Owid::verify_status_with_crypto`, `verify_status_with_public_key`|The same checks, answered with a `SignatureStatus`.|
-|`Owid::verify`, `verify_status`|Verify by fetching the creator public key over HTTP (`fetch` feature).|
+|`Owid::verify`, `verify_status`|Verify by fetching the creator public key from the well known end point through a `PublicKeyFetch`, asynchronously (`fetch` feature).|
 |`Creator::create`, `create_with_others`|Create and sign an OWID in one step, from anything that becomes bytes. The creator sets the version, the domain and the date.|
 |`Crypto::new`, `new_sign_only`, `new_verify_only`|Generate or import keys. Private keys are accepted in both PKCS#8 and SEC1 PEM forms.|
 |`Crypto::public_key_pem`, `private_key_pem`|Export keys as PEM.|
@@ -334,11 +385,14 @@ and the proof that an OWID cannot be held unsigned.
 
 The examples in this file are documentation tests, so `cargo test
 --all-features` compiles and runs them and they cannot quietly stop
-working.
+working. The `fetch` feature is built for `wasm32-wasip1` as well, which is
+the proof that verification through a host supplied transport needs nothing
+the target does not have.
 
 ```bash
 cargo test
 cargo test --all-features
+cargo build --no-default-features --features fetch --target wasm32-wasip1
 ```
 
 ## License

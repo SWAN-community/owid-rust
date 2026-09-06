@@ -549,16 +549,26 @@ fn a_marker_is_stepped_over_to_reach_the_next_frame() {
 }
 
 /// A key that could not be obtained at all is not a signature that does not
-/// match either. The request here fails in the transport before anything
-/// leaves the machine, because the scheme is not one it can use, so the test
-/// needs no network and no key end point.
+/// match either. The transport here answers with a failure before anything
+/// leaves the machine, so the test needs no network and no key end point.
 #[cfg(feature = "fetch")]
-#[test]
-fn a_key_that_cannot_be_obtained_is_not_an_invalid_signature() {
+#[tokio::test]
+async fn a_key_that_cannot_be_obtained_is_not_an_invalid_signature() {
+    use owid::{Error, FetchResponse, LocalBoxFuture, PublicKeyFetch};
+
+    /// A transport that never reaches anything.
+    struct Unreachable;
+
+    impl PublicKeyFetch for Unreachable {
+        fn fetch<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, owid::Result<FetchResponse>> {
+            Box::pin(async move { Err(Error::Http(format!("no route to {url}"))) })
+        }
+    }
+
     let owid = creator().create("Hello World").expect("should create");
 
     assert_eq!(
-        owid.verify_status("no-such-scheme", &[]),
+        owid.verify_status(&Unreachable, "https", &[]).await,
         SignatureStatus::KeyUnavailable,
         "a key that could not be fetched should not read as a forgery"
     );
