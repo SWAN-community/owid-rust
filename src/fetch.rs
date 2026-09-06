@@ -82,12 +82,30 @@ fn public_key_pem(url: &str) -> Result<String> {
     {
         return Ok(pem.clone());
     }
+    // Never follow a redirect. ureq follows up to five by default, to any
+    // other host, so a creator whose domain answered 302 to some other
+    // place would have that other place's key trusted as its own, and a
+    // network attacker able to bend the creator's DNS, or a creator that
+    // was simply misconfigured, could put a key there and have forgeries
+    // verify. With no redirects the 3xx is a status error, which reaches
+    // the caller as the key being unavailable, which it is.
     let pem = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(KEY_FETCH_TIMEOUT_SECONDS))
+        .redirects(0)
         .build()
         .get(url)
         .call()
-        .map_err(|e| Error::Http(e.to_string()))?
+        .map_err(|e| Error::Http(e.to_string()))?;
+    // ureq reports only 4xx and 5xx as errors. A 3xx arrives as a response
+    // with no key in it, and reading that as a key would report the
+    // creator's key as unreadable when it was never obtained at all.
+    if pem.status() != 200 {
+        return Err(Error::Http(format!(
+            "the public key end point answered {} for {url}",
+            pem.status()
+        )));
+    }
+    let pem = pem
         .into_string()
         .map_err(|e| Error::Http(e.to_string()))?;
     let mut held = cache().lock().expect("should lock the public key cache");
@@ -547,6 +565,61 @@ mod tests {
 
     /// An end point that cannot serve a key for the date leaves the signature
     /// unjudged rather than reporting it as a forgery.
+    #[test]
+    /// A creator whose domain answers with a redirect does not get the
+    /// key at the other end trusted as its own. The other end here is a
+    /// stand in serving the genuine schedule, so following the redirect
+    /// would read as valid, and refusing it must read as the key being
+    /// unavailable with the request to the other host never made. Without
+    /// this a network attacker able to bend a creator's DNS, or a
+    /// misconfigured creator, could substitute the key and forgeries
+    /// would verify.
+    #[test]
+    fn a_redirect_is_not_followed() {
+        let owid = identifier();
+        let elsewhere = KeyServer::start();
+        let location = elsewhere.url_for(&owid);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("should bind the creator");
+        let creator = format!(
+            "http://{}",
+            listener.local_addr().expect("should have an address")
+        );
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(_) => break,
+                };
+                let mut reader =
+                    BufReader::new(stream.try_clone().expect("should clone the connection"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && line.trim() != "" {
+                    line.clear();
+                }
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        let url = format!(
+            "{}/owid/api/v{}/public-key?format=pkcs",
+            creator,
+            owid.version().as_byte()
+        );
+        assert_eq!(
+            SignatureStatus::of(owid.verify_at_url(&url, &[])),
+            SignatureStatus::KeyUnavailable,
+            "a redirect is the key being unavailable, never a key from wherever it points"
+        );
+        assert!(
+            elsewhere.dates().is_empty(),
+            "the request that would have gone to the other host was never made"
+        );
+    }
+
     #[test]
     fn a_key_the_end_point_cannot_serve_is_key_unavailable() {
         let owid = identifier();
