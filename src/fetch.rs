@@ -563,7 +563,6 @@ mod tests {
 
     /// An end point that cannot serve a key for the date leaves the signature
     /// unjudged rather than reporting it as a forgery.
-    #[test]
     /// A creator whose domain answers with a redirect does not get the
     /// key at the other end trusted as its own. The other end here is a
     /// stand in serving the genuine schedule, so following the redirect
