@@ -105,9 +105,7 @@ fn public_key_pem(url: &str) -> Result<String> {
             pem.status()
         )));
     }
-    let pem = pem
-        .into_string()
-        .map_err(|e| Error::Http(e.to_string()))?;
+    let pem = pem.into_string().map_err(|e| Error::Http(e.to_string()))?;
     let mut held = cache().lock().expect("should lock the public key cache");
     if held.len() >= MAXIMUM_CACHED_KEYS {
         held.clear();
