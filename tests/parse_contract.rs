@@ -359,12 +359,12 @@ fn a_valid_envelope_with_a_bad_signature_parses_then_fails_verification() {
     );
     assert!(
         !owid
-            .verify_with_crypto(&crypto, &[])
+            .verify_with_crypto(&crypto)
             .expect("should run verification"),
         "verification should fail"
     );
     assert_eq!(
-        owid.verify_status_with_crypto(&crypto, &[]),
+        owid.verify_status_with_crypto(&crypto),
         SignatureStatus::Invalid,
         "a signature that does not match is the one status meaning distrust"
     );
@@ -380,7 +380,7 @@ fn a_key_that_cannot_be_read_is_not_an_invalid_signature() {
 
     for pem in ["", "not a PEM at all", "-----BEGIN PUBLIC KEY-----\nAAAA\n"] {
         assert_eq!(
-            owid.verify_status_with_public_key(pem, &[]),
+            owid.verify_status_with_public_key(pem),
             SignatureStatus::InvalidKey,
             "a key that cannot be read should not read as a forgery"
         );
@@ -549,16 +549,26 @@ fn a_marker_is_stepped_over_to_reach_the_next_frame() {
 }
 
 /// A key that could not be obtained at all is not a signature that does not
-/// match either. The request here fails in the transport before anything
-/// leaves the machine, because the scheme is not one it can use, so the test
-/// needs no network and no key end point.
+/// match either. The transport here answers with a failure before anything
+/// leaves the machine, so the test needs no network and no key end point.
 #[cfg(feature = "fetch")]
-#[test]
-fn a_key_that_cannot_be_obtained_is_not_an_invalid_signature() {
+#[tokio::test]
+async fn a_key_that_cannot_be_obtained_is_not_an_invalid_signature() {
+    use owid::{Error, FetchResponse, LocalBoxFuture, PublicKeyFetch};
+
+    /// A transport that never reaches anything.
+    struct Unreachable;
+
+    impl PublicKeyFetch for Unreachable {
+        fn fetch<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, owid::Result<FetchResponse>> {
+            Box::pin(async move { Err(Error::Http(format!("no route to {url}"))) })
+        }
+    }
+
     let owid = creator().create("Hello World").expect("should create");
 
     assert_eq!(
-        owid.verify_status("no-such-scheme", &[]),
+        owid.verify_status(&Unreachable, "https").await,
         SignatureStatus::KeyUnavailable,
         "a key that could not be fetched should not read as a forgery"
     );
@@ -574,9 +584,6 @@ fn creating_always_signs() {
     for owid in [
         creator.create("Hello World").expect("should create"),
         creator.create(b"bytes".to_vec()).expect("should create"),
-        creator
-            .create_with_others(b"bytes".to_vec(), &[])
-            .expect("should create"),
     ] {
         assert_eq!(
             owid.signature().len(),
@@ -585,18 +592,18 @@ fn creating_always_signs() {
         );
         assert_eq!(owid.domain(), DOMAIN, "the creator owns the domain");
         assert_eq!(
-            owid.verify_status_with_crypto(&crypto, &[]),
+            owid.verify_status_with_crypto(&crypto),
             SignatureStatus::Valid,
             "a created OWID verifies with the key that made it"
         );
     }
 }
 
-/// Everything a library user could do before construction was closed they
-/// can still do through the creator, including signing over other OWIDs as
-/// a processor adding itself to a transaction.
+/// A processor adding itself to a transaction creates an OWID of its own
+/// through its creator, and each OWID in the transaction verifies with the
+/// key of its own creator alone.
 #[test]
-fn a_library_user_can_still_do_everything() {
+fn each_owid_in_a_transaction_verifies_on_its_own() {
     let root_crypto = Crypto::new();
     let root = Creator::new("root.com", root_crypto.clone())
         .expect("should create the root creator")
@@ -607,26 +614,23 @@ fn a_library_user_can_still_do_everything() {
     let processor = Creator::new("processor.com", processor_crypto.clone())
         .expect("should create the processor creator");
     let response = processor
-        .create_with_others(b"response".to_vec(), &[&root])
-        .expect("should create over the others");
+        .create(b"response".to_vec())
+        .expect("should create the response");
 
     assert_eq!(
-        response.verify_status_with_crypto(&processor_crypto, &[&root]),
+        response.verify_status_with_crypto(&processor_crypto),
         SignatureStatus::Valid,
-        "should verify with the same others"
+        "the response verifies with the processor's key"
     );
     assert_eq!(
-        response.verify_status_with_crypto(&processor_crypto, &[]),
+        response.verify_status_with_crypto(&root_crypto),
         SignatureStatus::Invalid,
-        "should fail without the others"
+        "the response does not verify with the root's key"
     );
     assert_eq!(
-        root.verify_status_with_public_key(
-            &root_crypto.public_key_pem().expect("should export"),
-            &[]
-        ),
+        root.verify_status_with_public_key(&root_crypto.public_key_pem().expect("should export")),
         SignatureStatus::Valid,
-        "the root should verify with its own public key"
+        "the root verifies with its own public key"
     );
 }
 

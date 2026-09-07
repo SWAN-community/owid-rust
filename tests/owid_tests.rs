@@ -84,14 +84,14 @@ fn create() {
     let original = fixture.create_owid();
 
     let valid = original
-        .verify_with_crypto(&fixture.verifier(), &[])
+        .verify_with_crypto(&fixture.verifier())
         .expect("should verify the original");
     assert!(valid, "original should verify");
 
     let encoded = original.as_base64().expect("should encode to base 64");
     let copy = Owid::from_base64(&encoded).expect("should decode from base 64");
     let valid = copy
-        .verify_with_crypto(&fixture.verifier(), &[])
+        .verify_with_crypto(&fixture.verifier())
         .expect("should verify the copy");
     assert!(valid, "copy should verify");
 }
@@ -106,7 +106,7 @@ fn verification_fails_with_invalid_signature() {
     let owid = tampered(&signed, length - SIGNATURE_LENGTH);
 
     let valid = owid
-        .verify_with_crypto(&fixture.verifier(), &[])
+        .verify_with_crypto(&fixture.verifier())
         .expect("should run verification");
     assert!(!valid, "verification should fail with corrupted signature");
 }
@@ -119,7 +119,7 @@ fn verification_fails_with_wrong_public_key() {
 
     let wrong_key = Crypto::new();
     let valid = owid
-        .verify_with_crypto(&wrong_key, &[])
+        .verify_with_crypto(&wrong_key)
         .expect("should run verification");
     assert!(!valid, "verification should fail with the wrong public key");
 }
@@ -134,7 +134,7 @@ fn create_with_empty_payload() {
         .expect("should create the OWID");
 
     let valid = owid
-        .verify_with_crypto(&fixture.verifier(), &[])
+        .verify_with_crypto(&fixture.verifier())
         .expect("should verify");
     assert!(valid, "OWID with empty payload should verify");
 }
@@ -153,7 +153,7 @@ fn create_with_large_payload() {
         .expect("should create the OWID");
 
     let valid = owid
-        .verify_with_crypto(&fixture.verifier(), &[])
+        .verify_with_crypto(&fixture.verifier())
         .expect("should verify");
     assert!(valid, "OWID with large payload should verify");
 
@@ -177,7 +177,7 @@ fn creator_create_with_string_payload() {
     );
 
     let valid = owid
-        .verify_with_crypto(&fixture.verifier(), &[])
+        .verify_with_crypto(&fixture.verifier())
         .expect("should verify");
     assert!(valid, "OWID should verify");
 }
@@ -195,7 +195,7 @@ fn creator_create_with_byte_payload() {
     assert_eq!(owid.payload(), payload, "payload bytes should match");
 
     let valid = owid
-        .verify_with_crypto(&fixture.verifier(), &[])
+        .verify_with_crypto(&fixture.verifier())
         .expect("should verify");
     assert!(valid, "OWID should verify");
 }
@@ -228,7 +228,7 @@ fn serialization_roundtrip() {
     assert_eq!(encoded1, encoded2, "encodings should be identical");
     for owid in [&original, &decoded1, &decoded2] {
         let valid = owid
-            .verify_with_crypto(&fixture.verifier(), &[])
+            .verify_with_crypto(&fixture.verifier())
             .expect("should verify");
         assert!(valid, "every round trip should verify");
     }
@@ -262,9 +262,7 @@ fn batch_signing_and_verification() {
 
     let verifier = fixture.verifier();
     for owid in &owids {
-        let valid = owid
-            .verify_with_crypto(&verifier, &[])
-            .expect("should verify");
+        let valid = owid.verify_with_crypto(&verifier).expect("should verify");
         assert!(valid, "every OWID in the batch should verify");
     }
 }
@@ -283,7 +281,7 @@ fn modified_domain_fails_verification() {
     );
 
     let valid = owid
-        .verify_with_crypto(&fixture.verifier(), &[])
+        .verify_with_crypto(&fixture.verifier())
         .expect("should run verification");
     assert!(!valid, "modified domain should fail verification");
 }
@@ -295,7 +293,7 @@ fn verify_with_public_key_pem() {
     let owid = fixture.create_owid();
 
     let valid = owid
-        .verify_with_public_key(&fixture.public_pem, &[])
+        .verify_with_public_key(&fixture.public_pem)
         .expect("should verify with the PEM");
     assert!(valid, "OWID should verify with the public key PEM");
 }
@@ -346,7 +344,7 @@ fn base64_corrupt_missing_start() {
         result.is_err() || {
             let owid = result.expect("checked above");
             !owid
-                .verify_with_crypto(&fixture.verifier(), &[])
+                .verify_with_crypto(&fixture.verifier())
                 .unwrap_or(false)
         },
         "base 64 missing the start should error or fail verification"
@@ -368,52 +366,13 @@ fn byte_array_corrupt_every_byte() {
         let still_valid = match Owid::from_byte_array(&corrupted) {
             // A parse failure is an acceptable detection of the corruption.
             Err(_) => false,
-            Ok(parsed) => parsed.verify_with_crypto(&verifier, &[]).unwrap_or(false),
+            Ok(parsed) => parsed.verify_with_crypto(&verifier).unwrap_or(false),
         };
         assert!(
             !still_valid,
             "corruption of byte {i} should fail parsing or verification"
         );
     }
-}
-
-/// Signing an OWID together with others, as a processor does when adding
-/// itself to a transaction, must verify with the same others and fail with
-/// different others. Mirrors the sign and verify with others methods in the
-/// .NET and Go implementations.
-#[test]
-fn sign_and_verify_with_others() {
-    let root_fixture = Fixture::new();
-    let root = root_fixture.create_owid();
-
-    let processor_crypto = Crypto::new();
-    let processor = Creator::new("processor.com", processor_crypto.clone())
-        .expect("should create the processor creator");
-    let response = processor
-        .create_with_others(b"response".to_vec(), &[&root])
-        .expect("should create with others");
-
-    let valid = response
-        .verify_with_crypto(&processor_crypto, &[&root])
-        .expect("should verify with the same others");
-    assert!(valid, "should verify with the same others");
-
-    let valid = response
-        .verify_with_crypto(&processor_crypto, &[])
-        .expect("should run verification without the others");
-    assert!(!valid, "should fail verification without the others");
-
-    // A different payload guarantees different bytes. Signing is
-    // deterministic, so an identical domain, date, and payload would
-    // produce an identical OWID.
-    let other_root = root_fixture
-        .creator()
-        .create(b"different root".to_vec())
-        .expect("should create the other root");
-    let valid = response
-        .verify_with_crypto(&processor_crypto, &[&other_root])
-        .expect("should run verification with different others");
-    assert!(!valid, "should fail verification with different others");
 }
 
 /// An empty creator domain is rejected, mirroring the .NET configuration
@@ -479,11 +438,11 @@ fn modified_payload_fails_verification() {
     );
 
     let valid = owid
-        .verify_with_crypto(&fixture.verifier(), &[])
+        .verify_with_crypto(&fixture.verifier())
         .expect("should run verification");
     assert!(!valid, "modified payload should fail verification");
     assert_eq!(
-        owid.verify_status_with_crypto(&fixture.verifier(), &[]),
+        owid.verify_status_with_crypto(&fixture.verifier()),
         SignatureStatus::Invalid,
         "a signature that does not match is the one status meaning the \
          identifier should be distrusted"
@@ -510,7 +469,7 @@ fn non_ascii_payload_roundtrip() {
     );
 
     let valid = copy
-        .verify_with_crypto(&fixture.verifier(), &[])
+        .verify_with_crypto(&fixture.verifier())
         .expect("should verify");
     assert!(valid, "OWID should verify");
 }

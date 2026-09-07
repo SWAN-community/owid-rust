@@ -25,11 +25,9 @@
 //! checked, each of the Go, .NET, JavaScript, and Rust implementations
 //! verified all of these fixtures and rejected tampered copies.
 //!
-//! Three cases per language. "simple" is an ASCII payload signed alone,
-//! "utf8" is a non ASCII payload signed alone (the payloads were passed to
-//! .NET as UTF-8 bytes rather than through its ASCII string overload), and
-//! "chain" is a party OWID signed together with a root OWID from the same
-//! creator.
+//! Two cases per language. "simple" is an ASCII payload and "utf8" is a non
+//! ASCII payload (the payloads were passed to .NET as UTF-8 bytes rather
+//! than through its ASCII string overload).
 
 use owid::Owid;
 
@@ -43,8 +41,6 @@ struct LanguageFixtures {
     public_key_spki: &'static str,
     simple: &'static str,
     utf8: &'static str,
-    chain_party: &'static str,
-    chain_root: &'static str,
 }
 
 const GO: LanguageFixtures = LanguageFixtures {
@@ -64,14 +60,6 @@ const GO: LanguageFixtures = LanguageFixtures {
         "A2dvLnN3YW4tZGVtby51awA/vTMAFgAAAFrDvHJpY2gg4p2kIE9XSUQgwqPigqzxY+4Q",
         "gUGt84xC9HxHmHXDt+wcB0Y9a6E+Txm2F147Qacbp0CtrF8x7QCWZfkcKCKNGSM8hYZE",
         "fYjJtViG+tA+"
-    ),
-    chain_party: concat!(
-        "A2dvLnN3YW4tZGVtby51awA/vTMABQAAAHBhcnR5l7NyNmFw2lxqc4DKJWoq0UVd5ujG",
-        "V/+fvVxqYTRlwCFxaSuwvnhLQQHjX5spxWb4O08IeuiuGCat1WFB/Wqlyw=="
-    ),
-    chain_root: concat!(
-        "A2dvLnN3YW4tZGVtby51awA/vTMABAAAAHJvb3R/bEqzG8gAy9yTF1UMEtOlYXBBmn3a",
-        "20jxXq5NmxIC8iuZvduOXKMf+K8VoAapkWwfpoDKQHS09IhljasZqC0k"
     ),
 };
 
@@ -93,14 +81,6 @@ const DOTNET: LanguageFixtures = LanguageFixtures {
         "VuaeaDUej0sF+cHfYj/icDBmlBLOviC6ZE28am8EtY+IGuesFcg2rKMybcsAxMmnrDtF",
         "2xsk1cJvHgoIYpSJJQ=="
     ),
-    chain_party: concat!(
-        "A2RvdG5ldC5zd2FuLWRlbW8udWsAPb0zAAUAAABwYXJ0eXtD6H4R7GbvRyFU+bCKgjMA",
-        "ZFFm8KHln80XPwQOBb/Ub9EZfE4Ml3ueRkKX51+MD98RFgTSmjbqrAnzFkLlilA="
-    ),
-    chain_root: concat!(
-        "A2RvdG5ldC5zd2FuLWRlbW8udWsAPb0zAAQAAAByb290fErj2LccPYCduWUW8vY2aBjr",
-        "ecDfnTpVpv3+SESJMFW5pcuPKEQik2rC0fWEoB5Vr6e0k5inrhUGiF2c2Y2YDw=="
-    ),
 };
 
 const LANGUAGES: [&LanguageFixtures; 2] = [&GO, &DOTNET];
@@ -119,59 +99,20 @@ fn tamper(fixture: &str) -> Owid {
     Owid::from_byte_array(&bytes).expect("a tampered signature should still parse")
 }
 
-/// Every fixture signed alone verifies with the public key of the language
-/// that signed it.
+/// Every fixture verifies with the public key of the language that signed
+/// it.
 #[test]
-fn fixtures_signed_alone_verify() {
+fn fixtures_verify() {
     for language in LANGUAGES {
         for fixture in [language.simple, language.utf8] {
             let owid = Owid::from_base64(fixture).expect("should parse the fixture");
             assert!(
-                owid.verify_with_public_key(language.public_key_spki, &[])
+                owid.verify_with_public_key(language.public_key_spki)
                     .expect("should verify"),
                 "{} fixture should verify",
                 language.language
             );
         }
-    }
-}
-
-/// The chained fixtures verify when the root they were signed with is
-/// provided.
-#[test]
-fn chain_fixtures_verify() {
-    for language in LANGUAGES {
-        let party = Owid::from_base64(language.chain_party).expect("should parse the party");
-        let root = Owid::from_base64(language.chain_root).expect("should parse the root");
-        assert!(
-            root.verify_with_public_key(language.public_key_spki, &[])
-                .expect("should verify"),
-            "{} root should verify alone",
-            language.language
-        );
-        assert!(
-            party
-                .verify_with_public_key(language.public_key_spki, &[&root])
-                .expect("should verify"),
-            "{} party should verify with the root",
-            language.language
-        );
-    }
-}
-
-/// The chained fixtures must not verify without the others they were signed
-/// together with.
-#[test]
-fn chain_fixtures_require_others() {
-    for language in LANGUAGES {
-        let party = Owid::from_base64(language.chain_party).expect("should parse the party");
-        assert!(
-            !party
-                .verify_with_public_key(language.public_key_spki, &[])
-                .expect("should verify"),
-            "{} party should not verify without the root",
-            language.language
-        );
     }
 }
 
@@ -182,20 +123,12 @@ fn tampered_fixtures_rejected() {
         for fixture in [language.simple, language.utf8] {
             assert!(
                 !tamper(fixture)
-                    .verify_with_public_key(language.public_key_spki, &[])
+                    .verify_with_public_key(language.public_key_spki)
                     .expect("should verify"),
                 "tampered {} fixture should not verify",
                 language.language
             );
         }
-        let root = Owid::from_base64(language.chain_root).expect("should parse the root");
-        assert!(
-            !tamper(language.chain_party)
-                .verify_with_public_key(language.public_key_spki, &[&root])
-                .expect("should verify"),
-            "tampered {} party should not verify",
-            language.language
-        );
     }
 }
 
@@ -230,12 +163,7 @@ fn fixture_fields_match() {
 #[test]
 fn fixtures_roundtrip_byte_exact() {
     for language in LANGUAGES {
-        for fixture in [
-            language.simple,
-            language.utf8,
-            language.chain_party,
-            language.chain_root,
-        ] {
+        for fixture in [language.simple, language.utf8] {
             let owid = Owid::from_base64(fixture).expect("should parse the fixture");
             assert_eq!(
                 owid.as_base64().expect("should serialize"),

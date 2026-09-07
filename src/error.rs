@@ -57,12 +57,14 @@ pub enum Error {
     /// The crypto instance can not be used for the operation requested. For
     /// example, an attempt to sign with a verify only instance.
     KeyMissing(&'static str),
-    /// The format parameter for the public key end point was not one of the
-    /// valid values "spki" or "pkcs".
+    /// The format parameter for the public key end point names an encoding
+    /// other than "spki", the only one the specification defines.
     InvalidKeyFormat(String),
-    /// An HTTP request to a well known end point failed. The string contains
-    /// the underlying error message. Only returned when the `fetch` feature
-    /// is enabled.
+    /// An HTTP request to a well known end point failed, or was answered
+    /// without the key in force at the OWID's date. The string contains the
+    /// underlying error message.
+    /// Only returned when the `fetch` feature is enabled, by the transport
+    /// that made the request or by this crate reading the answer.
     Http(String),
     /// Bytes offered to be read were not an OWID.
     ///
@@ -107,8 +109,7 @@ impl fmt::Display for Error {
             }
             Error::InvalidKeyFormat(v) => write!(
                 f,
-                "format parameter 'spki' or 'pkcs' must be provided, \
-                 received '{v}'"
+                "the only public key format defined is 'spki', received '{v}'"
             ),
             Error::Http(e) => write!(f, "HTTP request failed because {e}"),
             Error::Parse(e) => write!(f, "bytes are not an OWID because {e}"),

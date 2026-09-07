@@ -69,11 +69,11 @@
 //! ## Signing
 //!
 //! The signing algorithm generates a SHA-256 digest of the OWID data
-//! structure without the signature field, optionally followed by the
-//! complete byte form of other OWIDs covered by the signature, and signs it
-//! with the ECDSA NIST P-256 private key of the creator. The 64 byte
-//! signature completes the OWID, and creating and signing are one step, so
-//! an OWID that exists is always signed and never changes afterwards.
+//! structure without the signature field and signs it with the ECDSA NIST
+//! P-256 private key of the creator. The signature covers the OWID's own
+//! bytes and nothing else. The 64 byte signature completes the OWID, and
+//! creating and signing are one step, so an OWID that exists is always
+//! signed and never changes afterwards.
 //!
 //! ## How an OWID comes into being
 //!
@@ -115,7 +115,7 @@
 //! // Later, or elsewhere, decode and verify with the creator public key.
 //! let copy = Owid::from_base64(&encoded).unwrap();
 //! let public_pem = crypto.public_key_pem().unwrap();
-//! assert!(copy.verify_with_public_key(&public_pem, &[]).unwrap());
+//! assert!(copy.verify_with_public_key(&public_pem).unwrap());
 //! ```
 //!
 //! ## Features
@@ -123,11 +123,18 @@
 //! The core crate has no network access and compiles for WebAssembly
 //! targets such as `wasm32-wasip1`.
 //!
-//! - `fetch` adds [`Owid::verify`] which retrieves the creator public key
-//!   over HTTP from the well known end point and caches it. The request
-//!   names the date the OWID was created, so a creator that rotates its
-//!   key returns the key that was in force then.
-//! - `endpoints` adds helpers for hosting the well known end points required
+//! - `fetch` adds [`Owid::verify`] and [`Owid::verify_status`], which
+//!   retrieve the creator public key from the well known end point through
+//!   a [`PublicKeyFetch`] the caller supplies, and hold the keys obtained.
+//!   The request names the date the OWID was created, so a creator that
+//!   rotates its key returns the key that was in force then. The fetch is
+//!   asynchronous, needs no particular runtime and does not require a
+//!   `Send` future. The feature adds no dependency and builds for
+//!   WebAssembly targets, where the host provides HTTP.
+//! - `reqwest-fetch` adds [`ReqwestFetch`], a transport over asynchronous
+//!   reqwest with rustls that never follows a redirect, for hosts that have
+//!   no HTTP of their own.
+//! - `endpoints` adds helpers for hosting the well known end point required
 //!   of an OWID creator.
 
 #![warn(missing_docs)]
@@ -136,8 +143,10 @@ mod creator;
 mod crypto;
 mod error;
 mod io;
+mod key_answer;
 mod owid;
 mod parse;
+mod schedule;
 mod status;
 mod version;
 
@@ -147,16 +156,24 @@ pub mod endpoints;
 #[cfg(feature = "fetch")]
 mod fetch;
 
+#[cfg(feature = "reqwest-fetch")]
+mod reqwest_fetch;
+
 pub use creator::{Configuration, Creator};
 pub use crypto::Crypto;
 pub use error::{Error, Result};
+pub use key_answer::PublicKeyAnswer;
 pub use owid::Owid;
 pub use parse::{ParseDetail, ParseError};
+pub use schedule::{DatedPublicKey, PublicKeySchedule};
 pub use status::{ParseStatus, SignatureStatus};
 pub use version::Version;
 
 #[cfg(feature = "fetch")]
-pub use fetch::public_key_url;
+pub use fetch::{clear_cache, public_key_url, FetchResponse, LocalBoxFuture, PublicKeyFetch};
+
+#[cfg(feature = "reqwest-fetch")]
+pub use reqwest_fetch::ReqwestFetch;
 
 /// The length of an OWID signature in bytes. The ECDSA P-256 signature is
 /// the 32 byte r value followed by the 32 byte s value.
@@ -166,6 +183,6 @@ pub const SIGNATURE_LENGTH: usize = 64;
 /// with the features they need, so the documented way to use this crate can
 /// not quietly stop working. In another port the README example had already
 /// stopped compiling and nothing noticed.
-#[cfg(all(doctest, feature = "fetch", feature = "endpoints"))]
+#[cfg(all(doctest, feature = "reqwest-fetch", feature = "endpoints"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeExamples;

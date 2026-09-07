@@ -15,8 +15,7 @@
  * ***************************************************************************/
 
 //! Walks through the OWID lifecycle. Creating keys, signing a payload,
-//! serializing, verifying, signing together with another OWID as a
-//! processor in a transaction, and observing that tampering breaks
+//! serializing, verifying, and observing that tampering breaks
 //! verification.
 //!
 //! Run with `cargo run --example create_and_verify`.
@@ -44,21 +43,7 @@ fn main() -> owid::Result<()> {
         "Payload '{}' created by '{}' verifies: {}",
         copy.payload_as_string(),
         copy.domain(),
-        copy.verify_with_crypto(&crypto, &[])?
-    );
-
-    // A processor receiving the OWID adds itself to the transaction by
-    // signing its own OWID together with the one received.
-    let processor_crypto = Crypto::new();
-    let processor = Creator::new("processor.com", processor_crypto.clone())?;
-    let response = processor.create_with_others(b"processed".to_vec(), &[&copy])?;
-    println!(
-        "Processor OWID verifies with the original: {}",
-        response.verify_with_crypto(&processor_crypto, &[&copy])?
-    );
-    println!(
-        "Processor OWID verifies without the original: {}",
-        response.verify_with_crypto(&processor_crypto, &[])?
+        copy.verify_with_crypto(&crypto)?
     );
 
     // Any change after signing breaks verification. An OWID is read only,
@@ -70,11 +55,11 @@ fn main() -> owid::Result<()> {
     let tampered = Owid::from_byte_array(&bytes)?;
     println!(
         "Tampered OWID verifies: {}",
-        tampered.verify_with_crypto(&crypto, &[])?
+        tampered.verify_with_crypto(&crypto)?
     );
     println!(
         "Tampered OWID signature status: {}",
-        tampered.verify_status_with_crypto(&crypto, &[])
+        tampered.verify_status_with_crypto(&crypto)
     );
 
     Ok(())
