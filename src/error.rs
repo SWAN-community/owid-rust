@@ -61,7 +61,8 @@ pub enum Error {
     /// valid values "spki" or "pkcs".
     InvalidKeyFormat(String),
     /// An HTTP request to a well known end point failed, or was answered
-    /// without the key. The string contains the underlying error message.
+    /// without the key in force at the OWID's date. The string contains the
+    /// underlying error message.
     /// Only returned when the `fetch` feature is enabled, by the transport
     /// that made the request or by this crate reading the answer.
     Http(String),

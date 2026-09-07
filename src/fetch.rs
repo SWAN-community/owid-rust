@@ -32,13 +32,18 @@
 //! The creator answers with the key and the moments it is valid from and to,
 //! and the key is held in memory for that whole span, as recommended by the
 //! specification, so an identifier dated inside it is verified without a
-//! request whichever minute it carries. A creator that states no span has
-//! its key held against the minutes it confirms. A signature that fails under
-//! the key selected, where the identifier is dated within the clock drift
-//! allowance of the edge of that key's span, is checked against the
-//! neighbouring key before it is reported as not matching. A caller that asks
-//! for a key while another caller is already fetching it waits for that fetch
-//! rather than starting a second.
+//! request whichever minute it carries. A creator that states the start
+//! alone has its key held from the start up to the clock drift allowance
+//! behind now, and one that states no span has its key held against the
+//! minutes it confirms. A signature that fails under the key selected, where
+//! the identifier is dated within the clock drift allowance of an edge of
+//! the span the creator stated for that key, is checked against the key for
+//! the minute just beyond that edge before it is reported as not matching.
+//! Where the creator's own statement puts the identifier's date outside the
+//! span of the key it answered with and nothing verifies, the key is
+//! reported as unavailable rather than the signature as not matching. A
+//! caller that asks for a key while another caller is already fetching it
+//! waits for that fetch rather than starting a second.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -69,8 +74,8 @@ pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 pub struct FetchResponse {
     /// The HTTP status code the end point answered with.
     pub status: u16,
-    /// The body of the answer as text, which is the key in PEM form when
-    /// the status is 200.
+    /// The body of the answer as text, which is the JSON answer carrying
+    /// the key and the span it covers when the status is 200.
     pub body: String,
 }
 
@@ -135,14 +140,15 @@ const MAXIMUM_CACHED_KEYS: usize = 1024;
 /// How far a creator's clock may run ahead of or behind this one's, in
 /// minutes.
 ///
-/// It is used in two places. A creator that does not state the span of the
-/// key it answers with reads a date later than its own now as now, so within
-/// this window of now this process cannot tell whether the creator read the
-/// minute as its past or as its present, and nothing learned from such an
-/// answer is held or served. And a creator's signing machines may not agree
-/// with the creator's own schedule to the minute, so an identifier dated
-/// within this window of a key's edge that does not verify under that key is
-/// checked against the neighbouring key before it is reported as not
+/// It is used in two places. A creator that does not state the end of the
+/// span of the key it answers with reads a date later than its own now as
+/// now, so within this window of now this process cannot tell whether the
+/// creator read the minute as its past or as its present, and nothing
+/// learned from such an answer is held or served. And a creator's signing
+/// machines may not agree with the creator's own schedule to the minute, so
+/// an identifier dated within this window of an edge of the span the creator
+/// stated for a key that does not verify under that key is checked against
+/// the key for the minute just beyond that edge before it is reported as not
 /// matching.
 const CLOCK_DRIFT_ALLOWANCE_MINUTES: u32 = 15;
 
@@ -164,6 +170,10 @@ struct HeldKey {
     last: u32,
     /// Whether the creator stated the whole span itself.
     explicit: bool,
+    /// Whether the creator stated the start of the span and no end, so that
+    /// as far as the creator has said the key is in force until further
+    /// notice, whatever this cache holds it for.
+    open_ended: bool,
 }
 
 impl HeldKey {
@@ -171,20 +181,59 @@ impl HeldKey {
     fn covers(&self, minute: u32) -> bool {
         self.first <= minute && minute <= self.last
     }
+
+    /// The span the creator stated for the key, which is the whole held
+    /// span where the creator stated it, runs to the last minute there is
+    /// where the creator stated a start and no end, and is nothing where
+    /// the creator stated no span.
+    fn stated(&self) -> KeyAnswer {
+        if self.explicit {
+            KeyAnswer::known(&self.pem, self.first, self.last)
+        } else if self.open_ended {
+            KeyAnswer::known(&self.pem, self.first, u32::MAX)
+        } else {
+            KeyAnswer::unknown(&self.pem)
+        }
+    }
 }
 
-/// What the cache or a fetch answers with: the key, and where it is known,
-/// the span of minutes the key covers, so that a caller can tell whether the
-/// identifier it is checking sits near the edge of the span.
+/// What the cache or a fetch answers with. The key, and where the creator
+/// stated one, the span of minutes the creator says the key covers, so that
+/// a caller can tell whether the identifier it is checking sits near an edge
+/// of the span, or outside it altogether. A span stated with a start and no
+/// end runs to the last minute there is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KeyAnswer {
+    /// The key in PEM form.
     pem: String,
+    /// The first minute the creator says the key covers.
     first: u32,
+    /// The last minute the creator says the key covers.
     last: u32,
+    /// Whether the creator stated a span at all.
     known: bool,
 }
 
 impl KeyAnswer {
+    /// The key with the span the creator stated in its answer, being the
+    /// minute it came into force and the minute the next key starts.
+    fn stated(pem: &str, start: Option<u32>, end: Option<u32>) -> Self {
+        match (start, end) {
+            (None, _) => KeyAnswer::unknown(pem),
+            (Some(start), Some(end)) if end > start => KeyAnswer::known(pem, start, end - 1),
+            (Some(start), _) => KeyAnswer::known(pem, start, u32::MAX),
+        }
+    }
+
+    fn known(pem: &str, first: u32, last: u32) -> Self {
+        KeyAnswer {
+            pem: pem.to_owned(),
+            first,
+            last,
+            known: true,
+        }
+    }
+
     fn unknown(pem: &str) -> Self {
         KeyAnswer {
             pem: pem.to_owned(),
@@ -194,9 +243,16 @@ impl KeyAnswer {
         }
     }
 
+    /// Whether the minute lies within the stated span.
     fn covers(&self, minute: u32) -> bool {
         self.known && self.first <= minute && minute <= self.last
     }
+}
+
+/// Whether the minute is no further from the edge minute than the clocks of
+/// a creator's signing machines are allowed to differ from its schedule.
+fn near_edge(minute: u32, edge: u32) -> bool {
+    minute.abs_diff(edge) <= CLOCK_DRIFT_ALLOWANCE_MINUTES
 }
 
 /// A failure shared with the callers waiting on a fetch. [`Error`] is not
@@ -233,26 +289,22 @@ struct Cache {
 
 impl Cache {
     /// The key held for the end point that is known to cover the minute, if
-    /// any. A minute within the drift allowance of now is only served where
-    /// the creator itself stated the span, because a span confirmed minute
-    /// by minute says nothing certain about such a minute.
+    /// any, with the span the creator stated for it. A minute within the
+    /// drift allowance of now is only served where the creator itself stated
+    /// the span, because a span confirmed minute by minute says nothing
+    /// certain about such a minute.
     fn held_for(&self, end_point: &str, minute: u32, recent: bool) -> Option<KeyAnswer> {
         self.keys
             .get(end_point)?
             .iter()
             .find(|key| key.covers(minute) && (key.explicit || !recent))
-            .map(|key| KeyAnswer {
-                pem: key.pem.clone(),
-                first: key.first,
-                last: key.last,
-                known: true,
-            })
+            .map(HeldKey::stated)
     }
 
     /// Records the creator's answer, being the key and, where the creator
     /// stated it, the span the key covers as the minute it came into force
-    /// and the minute the next key starts. Returns the key with the span it
-    /// is now known to cover.
+    /// and the minute the next key starts. Returns the key with the span the
+    /// creator stated for it.
     ///
     /// With both the start and the end the whole span is held as the
     /// creator's own statement. With the start alone the key is held from
@@ -273,40 +325,39 @@ impl Cache {
         start: Option<u32>,
         end: Option<u32>,
     ) -> KeyAnswer {
-        let (first, last, explicit) = match (start, end, minute) {
-            (Some(start), Some(end), _) if end > start => (start, end - 1, true),
+        let stated = KeyAnswer::stated(pem, start, end);
+        let (first, last, explicit, open_ended) = match (start, end, minute) {
+            (Some(start), Some(end), _) if end > start => (start, end - 1, true, false),
             (Some(start), _, _) => {
                 let now = minutes_since_base(&Utc::now()).unwrap_or(u32::MAX);
                 (
                     start,
                     start.max(now.saturating_sub(CLOCK_DRIFT_ALLOWANCE_MINUTES)),
                     false,
+                    true,
                 )
             }
-            (None, _, Some(minute)) if !recent => (minute, minute, false),
-            _ => return KeyAnswer::unknown(pem),
+            (None, _, Some(minute)) if !recent => (minute, minute, false, false),
+            _ => return stated,
         };
         if let Some(keys) = self.keys.get_mut(end_point) {
             if let Some(index) = keys.iter().position(|key| key.pem == pem) {
                 if widen(keys, index, first, last) {
-                    keys[index].explicit |= explicit;
-                    return KeyAnswer {
-                        pem: pem.to_owned(),
-                        first: keys[index].first,
-                        last: keys[index].last,
-                        known: true,
-                    };
+                    let key = &mut keys[index];
+                    key.explicit |= explicit;
+                    key.open_ended = !key.explicit && (key.open_ended || open_ended);
                 }
-                // The creator has answered with another key inside this span
-                // before, which it does not do unless it went back to a key
-                // it had left. Nothing more is held about this key.
-                return KeyAnswer::unknown(pem);
+                // Where the span was not widened the creator has answered
+                // with another key inside it before, which it does not do
+                // unless it went back to a key it had left, and nothing more
+                // is held about this key.
+                return stated;
             }
             if keys
                 .iter()
                 .any(|other| other.last >= first && other.first <= last)
             {
-                return KeyAnswer::unknown(pem);
+                return stated;
             }
         }
         if self.held >= MAXIMUM_CACHED_KEYS {
@@ -321,14 +372,10 @@ impl Cache {
                 first,
                 last,
                 explicit,
+                open_ended,
             });
         self.held += 1;
-        KeyAnswer {
-            pem: pem.to_owned(),
-            first,
-            last,
-            known: true,
-        }
+        stated
     }
 }
 
@@ -504,16 +551,24 @@ enum Turn {
 /// The date is left out where it cannot be counted, which no OWID read by
 /// this crate can be. See `minutes_since_base` in the io module.
 pub fn public_key_url(owid: &Owid, scheme: &str) -> String {
-    let path = format!(
+    let end_point = format!(
         "{}://{}/owid/api/v{}/public-key",
         scheme,
         owid.domain(),
         owid.version().as_byte()
     );
     match minutes_since_base(&owid.date()) {
-        Some(minutes) => format!("{path}?date={minutes}&format=pkcs"),
-        None => format!("{path}?format=pkcs"),
+        Some(minutes) => key_url_at(&end_point, minutes),
+        None => format!("{end_point}?{FORMAT_QUERY}"),
     }
+}
+
+/// The query naming the encoding the key is asked for in.
+const FORMAT_QUERY: &str = "format=pkcs";
+
+/// The URL that asks the key end point for the key in force at the minute.
+fn key_url_at(end_point: &str, minute: u32) -> String {
+    format!("{end_point}?date={minute}&{FORMAT_QUERY}")
 }
 
 /// Makes the request through the transport and reads the answer, taking
@@ -640,6 +695,10 @@ impl Owid {
     /// OWID dated inside it is verified without a request, and a caller that
     /// asks for a key while another caller is fetching it waits for that
     /// fetch.
+    /// A signature that fails under the key selected, where the OWID is
+    /// dated within the clock drift allowance of an edge of the span the
+    /// creator stated for that key, is checked against the key for the
+    /// minute just beyond that edge before it is reported as not matching.
     /// The future is not `Send`, so it can be driven by a single threaded
     /// host and by a transport tied to one thread, and it needs no
     /// particular runtime.
@@ -648,8 +707,12 @@ impl Owid {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Http`] if the public key can not be fetched, or any
-    /// error from [`Owid::verify_with_public_key`].
+    /// Returns [`Error::Http`] if the public key can not be fetched, or if
+    /// the creator's own statement puts the OWID's date outside the span of
+    /// the key it answered with and nothing verifies, because a key that was
+    /// not in force proves nothing about the OWID and `false` would read as
+    /// a forgery. Otherwise any error from
+    /// [`Owid::verify_with_public_key`].
     ///
     /// # Examples
     ///
@@ -686,52 +749,61 @@ impl Owid {
         if self.verify_with_public_key(&answer.pem, others)? {
             return Ok(true);
         }
-        self.neighbour_verifies(fetch, url, &answer, others).await
+        let Some(minute) = minutes_since_base(&self.date()) else {
+            return Ok(false);
+        };
+        if self
+            .neighbour_verifies(fetch, url, minute, &answer, others)
+            .await
+        {
+            return Ok(true);
+        }
+        if answer.known && !answer.covers(minute) {
+            return Err(Error::Http(
+                "the creator states that the key it answered with was not in force at the OWID's date, so the signature could not be checked".to_owned(),
+            ));
+        }
+        Ok(false)
     }
 
-    /// Whether a key neighbouring the one the OWID's own minute selected
-    /// verifies the signature instead.
+    /// Whether the key for the minute just beyond an edge of the span the
+    /// creator stated for the key tried verifies the signature instead.
     ///
     /// A creator's signing machines may not agree with its own schedule to
     /// the minute, so an identifier dated just after a key started may have
     /// been signed with the key before it, and one dated just before may
     /// have been signed with the key after. Where the signature does not
     /// verify under the key selected and the OWID's minute is within the
-    /// clock drift allowance of the edge of the span that key is known to
-    /// cover, the key for the minute just beyond that edge is asked for and
-    /// tried. A key already known to cover the neighbouring minute is not
-    /// asked for again, and a neighbour that turns out to be the same key is
-    /// not tried again. This costs at most two more requests, and only for a
+    /// clock drift allowance of an edge of the span the creator stated for
+    /// that key, the key for the minute just beyond that edge is asked for
+    /// and tried. A key already held for that minute is not asked for again,
+    /// a neighbour that turns out to be the same key is not tried again, and
+    /// a neighbour that cannot be fetched leaves the failure standing. A
+    /// creator that stated no span has one key and no schedule, so there is
+    /// no neighbour to try, and a span stated with a start and no end has no
+    /// later edge. This costs at most two more requests, and only for a
     /// signature that has already failed.
     async fn neighbour_verifies(
         &self,
         fetch: &dyn PublicKeyFetch,
         url: &str,
+        minute: u32,
         tried: &KeyAnswer,
         others: &[&Owid],
-    ) -> Result<bool> {
-        let Some(minute) = minutes_since_base(&self.date()) else {
-            return Ok(false);
-        };
-        if tried.known && !tried.covers(minute) {
-            // The key tried was never in force at the OWID's minute, so the
-            // OWID is not near an edge of that key's span.
-            return Ok(false);
+    ) -> bool {
+        if !tried.known {
+            return false;
         }
         let end_point = end_point_of(url);
-        for at in [
-            minute.checked_sub(CLOCK_DRIFT_ALLOWANCE_MINUTES),
-            minute.checked_add(CLOCK_DRIFT_ALLOWANCE_MINUTES),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if tried.covers(at) {
-                continue;
-            }
-            let Ok(neighbour) =
-                key_at_url(fetch, &format!("{end_point}?date={at}&format=pkcs")).await
-            else {
+        let mut beyond = Vec::with_capacity(2);
+        if tried.first > 0 && near_edge(minute, tried.first) {
+            beyond.push(tried.first - 1);
+        }
+        if tried.last < u32::MAX && near_edge(minute, tried.last) {
+            beyond.push(tried.last + 1);
+        }
+        for at in beyond {
+            let Ok(neighbour) = key_at_url(fetch, &key_url_at(end_point, at)).await else {
                 continue;
             };
             if neighbour.pem == tried.pem {
@@ -741,21 +813,23 @@ impl Owid {
                 .verify_with_public_key(&neighbour.pem, others)
                 .unwrap_or(false)
             {
-                return Ok(true);
+                return true;
             }
         }
-        Ok(false)
+        false
     }
 
     /// The same check as [`Owid::verify`], answered with the status that
     /// names the outcome.
     ///
     /// A key that can not be fetched is
-    /// [`SignatureStatus::KeyUnavailable`] and one that arrives in a form
-    /// this crate can not read is [`SignatureStatus::InvalidKey`]. Neither
-    /// is [`SignatureStatus::Invalid`], because an outage or a badly served
-    /// key leaves the signature unjudged and reporting it as invalid would
-    /// read as an attack.
+    /// [`SignatureStatus::KeyUnavailable`], and so is a key the creator's
+    /// own statement says was not in force at the OWID's date where nothing
+    /// verifies. One that arrives in a form this crate can not read is
+    /// [`SignatureStatus::InvalidKey`]. None of these is
+    /// [`SignatureStatus::Invalid`], because an outage, a badly served key
+    /// or a key that proves nothing leaves the signature unjudged and
+    /// reporting it as invalid would read as an attack.
     pub async fn verify_status(
         &self,
         fetch: &dyn PublicKeyFetch,
@@ -1304,7 +1378,8 @@ mod tests {
     /// about every time and never held, because a creator whose clock
     /// differs from this one's may have read it as its present rather than
     /// as the minute named. A minute beyond the allowance is held as usual.
-    /// Live identifiers therefore cost one request per minute per creator and older ones cost none.
+    /// Live identifiers from such a creator therefore cost one request per
+    /// minute and older ones cost none.
     #[tokio::test]
     async fn a_minute_within_the_drift_allowance_is_not_held() {
         let _serialised = CACHE_TESTS.lock().await;
@@ -1534,7 +1609,7 @@ mod tests {
         assert_eq!(
             stub.requests().len(),
             2,
-            "the neighbouring minutes lie inside the spans held"
+            "the identifier is further from every edge than clocks may differ"
         );
         let genuine = signed_at("creator.test", rotation + 3 * 24 * 60, &second);
         assert_eq!(
@@ -1546,6 +1621,138 @@ mod tests {
             forged.verify_status(&stub, "stub-edge", &[]).await,
             SignatureStatus::Invalid,
             "signed with a key not in force at its date"
+        );
+    }
+
+    /// The answer of a creator stating the key and the span given as
+    /// minutes, written the way [`PublicKeyAnswer`] writes it.
+    fn answer(pem: &str, start: Option<u32>, end: Option<u32>) -> FetchResponse {
+        let moment = |minutes: u32| base_date() + Duration::minutes(i64::from(minutes));
+        FetchResponse {
+            status: 200,
+            body: PublicKeyAnswer::new(pem, start.map(moment), end.map(moment)).to_json(),
+        }
+    }
+
+    /// The minute a request asks about, which every request in the tests
+    /// that use this names.
+    fn asked_minute(url: &str) -> u32 {
+        query_value(url, "date")
+            .and_then(|date| date.parse::<u32>().ok())
+            .expect("every request here is dated")
+    }
+
+    /// The neighbouring key is asked for by the minute just beyond the edge
+    /// of the span the creator stated, not by a minute a fixed distance from
+    /// the identifier, so a key in force for less than the drift allowance
+    /// is still the one tried.
+    #[tokio::test]
+    async fn the_neighbour_is_asked_for_by_the_minute_just_beyond_the_edge() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let first = Crypto::new();
+        let second = Crypto::new();
+        let first_pem = first.public_key_pem().unwrap();
+        let second_pem = second.public_key_pem().unwrap();
+        let week = 7 * 24 * 60;
+        let end = minutes_at("2026-08-31T00:00:00Z");
+        let rotation = end - week;
+        let start = rotation - week;
+        let stub = Stub::new(move |url| {
+            Ok(if asked_minute(url) < rotation {
+                answer(&first_pem, Some(start), Some(rotation))
+            } else {
+                answer(&second_pem, Some(rotation), Some(end))
+            })
+        });
+        let late = signed_at("creator.test", rotation + 5, &first);
+        assert_eq!(
+            late.verify_status(&stub, "stub-beyond", &[]).await,
+            SignatureStatus::Valid
+        );
+        assert_eq!(
+            stub.dates(),
+            vec![
+                Some((rotation + 5).to_string()),
+                Some((rotation - 1).to_string())
+            ],
+            "the identifier's own minute and then the minute just before the span started"
+        );
+    }
+
+    /// A key the creator states a start for and no end is in force until
+    /// further notice as far as the creator has said, so a live identifier
+    /// dated just after that start which does not verify under it is checked
+    /// against the key before it, even though the cache holds the key only
+    /// up to the drift allowance behind now.
+    #[tokio::test]
+    async fn a_key_stated_without_an_end_has_no_later_edge() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let first = Crypto::new();
+        let second = Crypto::new();
+        let first_pem = first.public_key_pem().unwrap();
+        let second_pem = second.public_key_pem().unwrap();
+        let week = 7 * 24 * 60;
+        let rotation = minutes_since_base(&Utc::now()).expect("should count now") - 5;
+        let start = rotation - week;
+        let stub = Stub::new(move |url| {
+            Ok(if asked_minute(url) < rotation {
+                answer(&first_pem, Some(start), Some(rotation))
+            } else {
+                answer(&second_pem, Some(rotation), None)
+            })
+        });
+        let live = signed_at("creator.test", rotation + 2, &first);
+        assert_eq!(
+            live.verify_status(&stub, "stub-open", &[]).await,
+            SignatureStatus::Valid,
+            "a live identifier signed with the key before the current one verifies"
+        );
+        assert_eq!(
+            stub.requests().len(),
+            2,
+            "the current key and then the key before it were asked for"
+        );
+    }
+
+    /// A creator whose own statement puts the identifier's date outside the
+    /// span of the key it answered with has said that key did not sign at
+    /// that date, so nothing verifying under it leaves the key unavailable
+    /// rather than the signature not matching. A forgery dated inside the
+    /// span is still reported as not matching.
+    #[tokio::test]
+    async fn a_key_the_creator_says_was_not_in_force_leaves_the_signature_unjudged() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let first = Crypto::new();
+        let second = Crypto::new();
+        let stranger = Crypto::new();
+        let second_pem = second.public_key_pem().unwrap();
+        let week = 7 * 24 * 60;
+        let end = minutes_at("2026-08-31T00:00:00Z");
+        let rotation = end - week;
+        // A creator that ignores the date asked about and answers with the
+        // current key and its span whatever the request.
+        let stub = Stub::new(move |_| Ok(answer(&second_pem, Some(rotation), Some(end))));
+        let earlier = signed_at("creator.test", rotation - 3 * 24 * 60, &first);
+        assert_eq!(
+            earlier.verify_status(&stub, "stub-not-in-force", &[]).await,
+            SignatureStatus::KeyUnavailable,
+            "the key answered with was not in force at the identifier's date"
+        );
+        assert!(
+            earlier
+                .verify(&stub, "stub-not-in-force", &[])
+                .await
+                .is_err(),
+            "the boolean form cannot say false without it reading as a forgery"
+        );
+        let forged = signed_at("creator.test", rotation + 3 * 24 * 60, &stranger);
+        assert_eq!(
+            forged.verify_status(&stub, "stub-not-in-force", &[]).await,
+            SignatureStatus::Invalid,
+            "a signature failing under the key in force at its date does not match"
         );
     }
 
@@ -1721,11 +1928,12 @@ mod tests {
         );
     }
 
-    /// The same identifier against the same end point without the date, which
-    /// is the request this crate made before the fix. The end point answers
-    /// with the key in force at the moment of the request, ten days after the
-    /// identifier was signed, the signature does not match it, and a genuine
-    /// identifier reads as a forgery.
+    /// The same identifier against the same end point without the date. The
+    /// end point answers with the key in force at the moment of the request,
+    /// ten days after the identifier was signed, and states a span that does
+    /// not reach the identifier's date, so the key it answered with proves
+    /// nothing about the identifier and the signature is left unjudged
+    /// rather than a genuine identifier reading as a forgery.
     #[tokio::test]
     async fn undated_fetch_leaves_an_earlier_weeks_identifier_unverified() {
         let owid = identifier();
@@ -1737,14 +1945,10 @@ mod tests {
         );
         assert_eq!(
             SignatureStatus::of(owid.verify_at_url(&stub, &undated, &[]).await),
-            SignatureStatus::Invalid,
-            "an undated request gets the key in force at the request, which did not sign it"
+            SignatureStatus::KeyUnavailable,
+            "an undated request gets the key in force at the request, which the creator says was not in force when the identifier was signed"
         );
-        assert_eq!(
-            stub.dates(),
-            vec![None],
-            "the request should carry no date, as it did before the fix"
-        );
+        assert_eq!(stub.dates(), vec![None], "the request carries no date");
     }
 
     /// A creator whose domain answers with a redirect does not get the key

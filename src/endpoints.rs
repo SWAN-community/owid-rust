@@ -23,8 +23,9 @@
 //!
 //! - `/owid/api/v{version}/creator` returning JSON with the domain, common
 //!   name, and public key of the creator.
-//! - `/owid/api/v{version}/public-key` returning the public key as PEM text.
-//!   The `format` query parameter must be `spki` or `pkcs`.
+//! - `/owid/api/v{version}/public-key` returning a JSON object carrying the
+//!   public key and the moments it is valid from and to. The `format` query
+//!   parameter must be `spki` or `pkcs`.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
