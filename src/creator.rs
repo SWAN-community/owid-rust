@@ -38,7 +38,7 @@ pub struct Configuration {
 
 /// Needed to create new OWIDs.
 ///
-/// A creator binds the domain that hosts the well known end points to the
+/// A creator binds the domain that hosts the well known end point to the
 /// crypto instance holding the signing key.
 #[derive(Debug, Clone)]
 pub struct Creator {

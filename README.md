@@ -29,7 +29,7 @@ environments. Three optional features extend it.
   rustls, which never follows a redirect, for hosts that have no HTTP of
   their own.
 * `endpoints` adds framework agnostic helpers for hosting the well known end
-  points that an OWID creator must serve.
+  point that an OWID creator must serve.
 
 ## How an OWID comes into being
 
@@ -308,21 +308,15 @@ impl PublicKeyFetch for HostFetch {
 # async fn host_get(_url: &str) -> Result<(u16, String)> { Ok((404, String::new())) }
 ```
 
-Host the well known end points with any HTTP framework. Requires the
+Host the well known end point with any HTTP framework. Requires the
 `endpoints` feature.
 
 ```rust
 use owid::{endpoints, Creator};
 
-fn responses(creator: &Creator) -> (String, String) {
-    // GET /owid/api/v3/creator
-    let creator_body =
-        endpoints::creator_response(creator, "Example Org", "").unwrap();
-
+fn response(creator: &Creator) -> String {
     // GET /owid/api/v3/public-key?format=spki
-    let key_body = endpoints::public_key_response(creator, "spki").unwrap();
-
-    (creator_body, key_body)
+    endpoints::public_key_response(creator, "spki").unwrap()
 }
 ```
 

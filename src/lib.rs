@@ -134,7 +134,7 @@
 //! - `reqwest-fetch` adds [`ReqwestFetch`], a transport over asynchronous
 //!   reqwest with rustls that never follows a redirect, for hosts that have
 //!   no HTTP of their own.
-//! - `endpoints` adds helpers for hosting the well known end points required
+//! - `endpoints` adds helpers for hosting the well known end point required
 //!   of an OWID creator.
 
 #![warn(missing_docs)]
