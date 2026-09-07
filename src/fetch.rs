@@ -127,6 +127,21 @@ pub trait PublicKeyFetch: Send + Sync {
 /// long as the process runs.
 const MAXIMUM_CACHED_KEYS: usize = 1024;
 
+/// How far a creator's clock may run ahead of or behind this one's, in
+/// minutes. A minute closer to now than this, or later, is asked about
+/// rather than served from the cache, and is not held.
+///
+/// A creator reads a date later than its own now as now, and answers with
+/// the key in force now. Within this window this process cannot tell whether
+/// the creator read the minute as its past or as its present, so the answer
+/// says nothing certain about the minute. An identifier signed just after a
+/// rotation by a creator whose clock runs ahead would otherwise be served
+/// the old key from a span confirmed up to now, and would read as not
+/// matching until this clock caught up. Identifiers dated within the window
+/// are asked about once per minute per creator, as they always were, and
+/// every older identifier is served from the spans.
+const CLOCK_DRIFT_ALLOWANCE_MINUTES: u32 = 15;
+
 /// One key a creator has answered with, and the span of minutes the creator
 /// has confirmed it was in force for.
 ///
@@ -252,28 +267,25 @@ fn end_point_of(url: &str) -> &str {
     url.split_once('?').map_or(url, |(end_point, _)| end_point)
 }
 
-/// The minute the cache reads the URL as asking about.
+/// The minute the cache reads the URL as asking about, or `None` where the
+/// cache must not be used for the request.
 ///
-/// The date parameter where the URL carries one, and otherwise now, because
-/// a creator answers a request without a date with the key in force now. A
-/// date later than now is read as now as well, because that is how a
-/// creator reads it. A schedule is published ahead of time and a key that
-/// has not started has signed nothing, so the creator answers a future date
-/// with the key in force now, and that answer must be held against now
-/// rather than against a minute the creator has not spoken for. Held against
-/// the future minute, the key would still be served for that minute after
-/// the creator had rotated, and a genuine identifier signed then would read
-/// as not matching.
-fn minute_of(url: &str) -> u32 {
-    let now = minutes_since_base(&Utc::now()).unwrap_or(u32::MAX);
-    url.split_once('?')
-        .and_then(|(_, query)| {
-            query
-                .split('&')
-                .find_map(|pair| pair.strip_prefix("date="))
-                .and_then(|minutes| minutes.parse::<u32>().ok())
-        })
-        .map_or(now, |minute| minute.min(now))
+/// The date parameter where the URL carries one and it is at least
+/// [`CLOCK_DRIFT_ALLOWANCE_MINUTES`] behind now. A request without a date
+/// asks for the key in force now, and one dated within the allowance, or
+/// later, may be read by the creator as its present rather than as the
+/// minute named, so neither is served from the cache nor held in it.
+fn minute_of(url: &str) -> Option<u32> {
+    let oldest_recent =
+        minutes_since_base(&Utc::now())?.checked_sub(CLOCK_DRIFT_ALLOWANCE_MINUTES)?;
+    let minute = url
+        .split_once('?')?
+        .1
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("date="))?
+        .parse::<u32>()
+        .ok()?;
+    (minute <= oldest_recent).then_some(minute)
 }
 
 /// Locks the cache shared by every verification in the process. A panic
@@ -452,7 +464,7 @@ async fn public_key_pem(fetch: &dyn PublicKeyFetch, url: &str) -> Result<String>
         // caller ever holds it across a fetch.
         let turn = {
             let mut held = cache();
-            if let Some(pem) = held.held_pem(end_point, minute) {
+            if let Some(pem) = minute.and_then(|minute| held.held_pem(end_point, minute)) {
                 return Ok(pem);
             }
             match held.in_flight.get(url) {
@@ -485,7 +497,9 @@ async fn public_key_pem(fetch: &dyn PublicKeyFetch, url: &str) -> Result<String>
                         // Held before the leader is dropped, so a caller
                         // arriving between the two finds the key rather
                         // than starting a fetch of its own.
-                        cache().hold(end_point, minute, pem);
+                        if let Some(minute) = minute {
+                            cache().hold(end_point, minute, pem);
+                        }
                         Ok(pem.clone())
                     }
                     Err(Error::Http(message)) => Err(message.clone()),
@@ -899,9 +913,20 @@ mod tests {
         .clone()
     }
 
-    /// How many keys the cache holds.
+    /// How many keys the cache holds in all.
     fn held_keys() -> usize {
         cache().held
+    }
+
+    /// How many keys the cache holds for the 51d.es end point asked through
+    /// the scheme. The cache is shared by every test in the process and the
+    /// harness runs them in parallel, so a count over the whole cache would
+    /// see the keys other tests are fetching at the same moment.
+    fn held_keys_at(scheme: &str) -> usize {
+        cache()
+            .keys
+            .get(&format!("{scheme}://51d.es/owid/api/v3/public-key"))
+            .map_or(0, Vec::len)
     }
 
     /// A key the creator has confirmed for two minutes is served for every
@@ -942,7 +967,7 @@ mod tests {
             "a minute between two confirmed minutes is not asked about"
         );
         assert_eq!(
-            held_keys(),
+            held_keys_at("stub-span"),
             1,
             "one key is held however many minutes it covers"
         );
@@ -957,7 +982,7 @@ mod tests {
             "a minute before the span is asked about"
         );
         assert_eq!(
-            held_keys(),
+            held_keys_at("stub-span"),
             2,
             "the earlier week's key is held as a second key"
         );
@@ -1003,7 +1028,7 @@ mod tests {
         pem_at(&stub, "stub-rotation", rotation - week).await;
         pem_at(&stub, "stub-rotation", rotation + week - 1).await;
         assert_eq!(stub.requests().len(), 2);
-        assert_eq!(held_keys(), 2);
+        assert_eq!(held_keys_at("stub-rotation"), 2);
 
         // Every minute across the rotation, in an order that walks in from
         // both sides, is answered with the key the schedule gives, whether
@@ -1027,7 +1052,11 @@ mod tests {
                 "the key served for minute {minute}"
             );
         }
-        assert_eq!(held_keys(), 2, "two keys are held, each with its own span");
+        assert_eq!(
+            held_keys_at("stub-rotation"),
+            2,
+            "two keys are held, each with its own span"
+        );
         let asked = stub.requests().len();
         assert!(
             asked > 2 && asked < 2 + minutes.len(),
@@ -1052,26 +1081,31 @@ mod tests {
         );
     }
 
-    /// A date later than now is held against now, because a creator answers
-    /// a future date with the key in force now and a key held against a
-    /// minute the creator has not spoken for would be served for that minute
-    /// after the creator had rotated. Two future dates therefore share one
-    /// request, and so does a request with no date.
+    /// A minute within the clock drift allowance of now, or later, is asked
+    /// about every time and never held, because a creator whose clock
+    /// differs from this one's may have read it as its present rather than
+    /// as the minute named. A minute beyond the allowance is held as usual.
+    /// Live identifiers therefore cost one request per minute per creator,
+    /// as they always did, and older ones cost none.
     #[tokio::test]
-    async fn a_future_date_is_held_against_now() {
+    async fn a_minute_within_the_drift_allowance_is_not_held() {
         let _serialised = CACHE_TESTS.lock().await;
         clear_cache();
         let stub = Stub::end_point();
         let started = minutes_since_base(&Utc::now()).expect("should count now");
-        let week = 7 * 24 * 60;
-        pem_at(&stub, "stub-future", started + week).await;
-        pem_at(&stub, "stub-future", started + 2 * week).await;
+        let recent = started - 1;
+        pem_at(&stub, "stub-drift", recent).await;
+        pem_at(&stub, "stub-drift", recent).await;
+        pem_at(&stub, "stub-drift", started + 7 * 24 * 60).await;
         public_key_pem(
             &stub,
-            "stub-future://51d.es/owid/api/v3/public-key?format=pkcs",
+            "stub-drift://51d.es/owid/api/v3/public-key?format=pkcs",
         )
         .await
         .expect("should answer with the key in force now");
+        let old = started - CLOCK_DRIFT_ALLOWANCE_MINUTES - 1;
+        pem_at(&stub, "stub-drift", old).await;
+        pem_at(&stub, "stub-drift", old).await;
         if minutes_since_base(&Utc::now()) != Some(started) {
             // The minute changed during the test, so the calls were not all
             // about the same now and the count says nothing.
@@ -1079,8 +1113,13 @@ mod tests {
         }
         assert_eq!(
             stub.requests().len(),
+            5,
+            "the recent minute was asked about twice, the future minute and the request with no date once each, and the old minute once with the second call held"
+        );
+        assert_eq!(
+            held_keys_at("stub-drift"),
             1,
-            "two future dates and no date are all now, and now was asked about once"
+            "only the old minute's key is held"
         );
     }
 
