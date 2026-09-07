@@ -166,7 +166,7 @@ pub use status::{ParseStatus, SignatureStatus};
 pub use version::Version;
 
 #[cfg(feature = "fetch")]
-pub use fetch::{public_key_url, FetchResponse, LocalBoxFuture, PublicKeyFetch};
+pub use fetch::{clear_cache, public_key_url, FetchResponse, LocalBoxFuture, PublicKeyFetch};
 
 #[cfg(feature = "reqwest-fetch")]
 pub use reqwest_fetch::ReqwestFetch;

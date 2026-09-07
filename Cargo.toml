@@ -20,7 +20,10 @@ serde_json = { version = "1", optional = true }
 [dev-dependencies]
 # The tests drive the asynchronous key fetch on a current thread runtime.
 # The crate itself needs no runtime.
-tokio = { version = "1", features = ["rt", "macros"] }
+# "sync" provides the mutex that serialises the tests which depend on
+# the process wide key cache, since the test harness runs tests in
+# parallel and one emptying the cache would otherwise disturb another.
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
 
 [features]
 default = []

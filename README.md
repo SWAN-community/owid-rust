@@ -233,6 +233,9 @@ honour the date. Keys are held against the URL they came from, which names
 the domain, the version and the minute, up to 1024 of them before the cache
 is emptied, and a caller that asks for a key while another caller is
 fetching it waits for that fetch rather than starting a second.
+`clear_cache` empties what is held, which is how a long running process
+drops a key it has learned it should no longer trust, after a creator
+rotates its key following a compromise.
 
 ```text
 GET https://[domain]/owid/api/v3/public-key?date=3510720&format=pkcs
@@ -316,6 +319,7 @@ fn responses(creator: &Creator) -> (String, String) {
 |`Error`|Errors from creating, signing, serializing and verifying.|
 |`PublicKeyFetch`, `FetchResponse`, `LocalBoxFuture`|The transport that makes the public key request for `Owid::verify`, what it hands back, and the boxed future it answers with, which is not required to be `Send` (`fetch` feature).|
 |`ReqwestFetch`|The ready made transport over asynchronous reqwest with rustls, which never follows a redirect (`reqwest-fetch` feature).|
+|`clear_cache`|Empties the held public keys, so the next verification asks the creator again (`fetch` feature).|
 
 ### Methods
 

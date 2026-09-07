@@ -141,6 +141,25 @@ fn cache() -> MutexGuard<'static, Cache> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Empties the key cache, so that the next verification asks the creator
+/// again for every key rather than using one already held.
+///
+/// The cache lives for as long as the process, so a key stays until it is
+/// pushed out by the limit. A process that has learned it should no longer
+/// trust a key it already holds, because the creator rotated after a
+/// compromise, calls this to drop it. The same is offered by every other
+/// port that caches, as `clearCache` in Java and PHP, `clear_cache` in
+/// Python, `ClearKeyCache` in Go and `ClearPublicKeyCache` in .NET.
+///
+/// A fetch already under way is not stopped, and the callers waiting on it
+/// still receive its answer. Only what is held is dropped, so a caller
+/// arriving afterwards starts a fresh request.
+pub fn clear_cache() {
+    let mut held = cache();
+    held.keys.clear();
+    held.in_flight.clear();
+}
+
 /// Holds a key against the URL it came from, emptying the cache first when
 /// it is full.
 fn hold(url: &str, pem: &str) {
@@ -679,6 +698,7 @@ mod tests {
     /// every test in the process and is keyed by the whole URL.
     #[tokio::test]
     async fn keys_are_held_per_request_and_not_per_domain() {
+        let _serialised = CACHE_TESTS.lock().await;
         let stub = Stub::end_point();
         let earlier = crafted(
             Version::Version3,
@@ -906,6 +926,49 @@ mod tests {
             stub.requests().len(),
             1,
             "the second caller should wait for the first caller's fetch"
+        );
+    }
+
+    /// Serialises the tests that depend on the process wide key cache.
+    ///
+    /// The harness runs tests in parallel, so a test that empties the cache
+    /// would otherwise be able to do so in the middle of a test that is
+    /// counting requests and expecting a key it fetched to still be held.
+    static CACHE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A key already held is used without asking again, and emptying the
+    /// cache makes the next caller ask. This is how a process drops a key it
+    /// has learned it should no longer trust.
+    #[tokio::test]
+    async fn clearing_the_cache_makes_the_next_caller_fetch_again() {
+        let _serialised = CACHE_TESTS.lock().await;
+        let owid = identifier();
+        let stub = Stub::end_point();
+
+        assert_eq!(
+            owid.verify_status(&stub, "stub-cleared", &[]).await,
+            SignatureStatus::Valid
+        );
+        assert_eq!(
+            owid.verify_status(&stub, "stub-cleared", &[]).await,
+            SignatureStatus::Valid
+        );
+        assert_eq!(
+            stub.requests().len(),
+            1,
+            "the second caller should be answered from the cache"
+        );
+
+        clear_cache();
+
+        assert_eq!(
+            owid.verify_status(&stub, "stub-cleared", &[]).await,
+            SignatureStatus::Valid
+        );
+        assert_eq!(
+            stub.requests().len(),
+            2,
+            "the cache was emptied so the key should be asked for again"
         );
     }
 
