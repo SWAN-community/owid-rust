@@ -237,16 +237,24 @@ until the next key starts, so a key the creator answers with at two minutes was
 in force at every minute between them, and an identifier dated inside a
 confirmed span is verified without a request whichever minute it carries. One
 dated outside every span is asked about, which widens the span when the same
-key comes back. One dated within fifteen minutes of now, or later, is asked
-about every time and never held, because a creator whose clock differs from
-this one's may have read that minute as its present rather than as the minute
-named. Live identifiers therefore cost one request per minute per creator, as
-they always did, and older ones cost none. At most 1024 keys are held across
-every creator before the cache is emptied and filled again, and a caller that
-asks for a key while another caller is fetching it waits for that fetch rather
-than starting a second. `clear_cache` empties what is held, which is how a long
-running process drops a key it has learned it should no longer trust, after a
-creator rotates its key following a compromise.
+key comes back. The creator answers with the key and the moments it is valid
+from and to, so the whole span is held from one answer and an identifier dated
+anywhere in it is verified without a request whatever the clock drift. An
+answer in any other form, the PEM alone among them, is reported as a key that
+cannot be read. A signature that does not verify under the key selected, where
+the identifier is dated within fifteen minutes of the edge of that key's span,
+is checked against the neighbouring key before it is reported as not matching,
+because a creator's signing machines may not agree with its schedule to the
+minute. One dated within fifteen minutes of now, or later, is asked about every
+time and never held, because a creator whose clock differs from this one's may
+have read that minute as its present rather than as the minute named. Live
+identifiers therefore cost one request per minute per creator, as they always
+did, and older ones cost none. At most 1024 keys are held across every creator
+before the cache is emptied and filled again, and a caller that asks for a key
+while another caller is fetching it waits for that fetch rather than starting a
+second. `clear_cache` empties what is held, which is how a long running process
+drops a key it has learned it should no longer trust, after a creator rotates
+its key following a compromise.
 
 ```text
 GET https://[domain]/owid/api/v3/public-key?date=3510720&format=pkcs
@@ -331,6 +339,9 @@ fn responses(creator: &Creator) -> (String, String) {
 |`PublicKeyFetch`, `FetchResponse`, `LocalBoxFuture`|The transport that makes the public key request for `Owid::verify`, what it hands back, and the boxed future it answers with, which is not required to be `Send` (`fetch` feature).|
 |`ReqwestFetch`|The ready made transport over asynchronous reqwest with rustls, which never follows a redirect (`reqwest-fetch` feature).|
 |`clear_cache`|Empties the held public keys, so the next verification asks the creator again (`fetch` feature).|
+|`PublicKeyAnswer`|The JSON body of the public key end point, the key with the moments it is valid from and to, read, written and checked the same way by creators and clients.|
+|`DatedPublicKey`, `PublicKeySchedule`|A creator's published schedule of keys and the rule for the key in force at a moment.|
+|`endpoints::public_key_response_at`, `endpoints::public_key_answer`|The status and JSON body a creator with a schedule answers a public key request with, checked before it is returned (`endpoints` feature).|
 
 ### Methods
 

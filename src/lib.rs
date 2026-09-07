@@ -143,8 +143,10 @@ mod creator;
 mod crypto;
 mod error;
 mod io;
+mod key_answer;
 mod owid;
 mod parse;
+mod schedule;
 mod status;
 mod version;
 
@@ -160,8 +162,10 @@ mod reqwest_fetch;
 pub use creator::{Configuration, Creator};
 pub use crypto::Crypto;
 pub use error::{Error, Result};
+pub use key_answer::PublicKeyAnswer;
 pub use owid::Owid;
 pub use parse::{ParseDetail, ParseError};
+pub use schedule::{DatedPublicKey, PublicKeySchedule};
 pub use status::{ParseStatus, SignatureStatus};
 pub use version::Version;
 

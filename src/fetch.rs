@@ -29,13 +29,16 @@
 //! so no particular runtime is needed and a single threaded host can drive
 //! it.
 //!
-//! Keys are cached in memory after the first request, as recommended by the
-//! specification, to avoid repeated requests to the public-key end point of
-//! other processors. Each key is held against the span of minutes the
-//! creator has confirmed it for, so an identifier dated inside a confirmed
-//! span is verified without a request whichever minute it carries. A caller
-//! that asks for a key while another caller is already fetching it waits for
-//! that fetch rather than starting a second.
+//! The creator answers with the key and the moments it is valid from and to,
+//! and the key is held in memory for that whole span, as recommended by the
+//! specification, so an identifier dated inside it is verified without a
+//! request whichever minute it carries. A creator that states no span has
+//! its key held against the minutes it confirms. A signature that fails under
+//! the key selected, where the identifier is dated within the clock drift
+//! allowance of the edge of that key's span, is checked against the
+//! neighbouring key before it is reported as not matching. A caller that asks
+//! for a key while another caller is already fetching it waits for that fetch
+//! rather than starting a second.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -47,6 +50,7 @@ use chrono::Utc;
 
 use crate::error::{Error, Result};
 use crate::io::minutes_since_base;
+use crate::key_answer::PublicKeyAnswer;
 use crate::owid::Owid;
 use crate::status::SignatureStatus;
 
@@ -108,6 +112,7 @@ pub struct FetchResponse {
 ///         })
 ///     }
 /// }
+///
 /// # async fn host_get(_url: &str) -> Result<(u16, String)> { Ok((404, String::new())) }
 /// ```
 pub trait PublicKeyFetch: Send + Sync {
@@ -128,41 +133,86 @@ pub trait PublicKeyFetch: Send + Sync {
 const MAXIMUM_CACHED_KEYS: usize = 1024;
 
 /// How far a creator's clock may run ahead of or behind this one's, in
-/// minutes. A minute closer to now than this, or later, is asked about
-/// rather than served from the cache, and is not held.
+/// minutes.
 ///
-/// A creator reads a date later than its own now as now, and answers with
-/// the key in force now. Within this window this process cannot tell whether
-/// the creator read the minute as its past or as its present, so the answer
-/// says nothing certain about the minute. An identifier signed just after a
-/// rotation by a creator whose clock runs ahead would otherwise be served
-/// the old key from a span confirmed up to now, and would read as not
-/// matching until this clock caught up. Identifiers dated within the window
-/// are asked about once per minute per creator, as they always were, and
-/// every older identifier is served from the spans.
+/// It is used in two places. A creator that does not state the span of the
+/// key it answers with reads a date later than its own now as now, so within
+/// this window of now this process cannot tell whether the creator read the
+/// minute as its past or as its present, and nothing learned from such an
+/// answer is held or served. And a creator's signing machines may not agree
+/// with the creator's own schedule to the minute, so an identifier dated
+/// within this window of a key's edge that does not verify under that key is
+/// checked against the neighbouring key before it is reported as not
+/// matching.
 const CLOCK_DRIFT_ALLOWANCE_MINUTES: u32 = 15;
 
-/// One key a creator has answered with, and the span of minutes the creator
-/// has confirmed it was in force for.
+/// One key a creator has answered with, and the span of minutes the key is
+/// known to cover.
 ///
 /// A creator's key is in force from the start of its period until the next
 /// key starts, so a key the creator confirms at two minutes was in force at
-/// every minute between them. The span grows as the creator confirms the
-/// same key for more minutes, and an identifier dated inside it is verified
-/// without a request.
+/// every minute between them. Where the creator stated the span in its answer
+/// the span is explicit and complete, and an identifier dated anywhere inside
+/// it is verified without a request. Otherwise the span grows as the creator
+/// confirms the same key for more minutes.
 struct HeldKey {
     /// The key in PEM form, as the creator served it.
     pem: String,
-    /// The earliest minute the creator has confirmed the key for.
+    /// The earliest minute the key is known to cover.
     first: u32,
-    /// The latest minute the creator has confirmed the key for.
+    /// The latest minute the key is known to cover.
     last: u32,
+    /// Whether the creator stated the whole span itself.
+    explicit: bool,
 }
 
 impl HeldKey {
-    /// Whether the minute lies within the confirmed span.
+    /// Whether the minute lies within the known span.
     fn covers(&self, minute: u32) -> bool {
         self.first <= minute && minute <= self.last
+    }
+}
+
+/// What the cache or a fetch answers with: the key, and where it is known,
+/// the span of minutes the key covers, so that a caller can tell whether the
+/// identifier it is checking sits near the edge of the span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyAnswer {
+    pem: String,
+    first: u32,
+    last: u32,
+    known: bool,
+}
+
+impl KeyAnswer {
+    fn unknown(pem: &str) -> Self {
+        KeyAnswer {
+            pem: pem.to_owned(),
+            first: 0,
+            last: 0,
+            known: false,
+        }
+    }
+
+    fn covers(&self, minute: u32) -> bool {
+        self.known && self.first <= minute && minute <= self.last
+    }
+}
+
+/// A failure shared with the callers waiting on a fetch. [`Error`] is not
+/// `Clone`, so the kind and the message are carried and the error rebuilt.
+#[derive(Debug, Clone)]
+enum FetchFailure {
+    Http(String),
+    Key(String),
+}
+
+impl FetchFailure {
+    fn into_error(self) -> Error {
+        match self {
+            FetchFailure::Http(message) => Error::Http(message),
+            FetchFailure::Key(message) => Error::Key(message),
+        }
     }
 }
 
@@ -172,16 +222,9 @@ impl HeldKey {
 struct Cache {
     /// Keys already fetched, by the creator's key end point, which is the
     /// key URL without its date. Each end point holds the keys the creator
-    /// has answered with, each with the span of minutes the creator has
-    /// confirmed it for.
-    ///
-    /// The key URL carries the date of the identifier being verified, in
-    /// minutes, and a creator's key changes on the order of a week. Keyed by
-    /// the whole URL, as this cache once was, two identifiers signed a minute
-    /// apart never shared an entry, so a hundred identifiers over a hundred
-    /// minutes made a hundred requests for one key. Keyed by end point and
-    /// span, an identifier dated between two minutes the creator has already
-    /// answered for is verified without a request.
+    /// has answered with, each with the span of minutes it is known to
+    /// cover, so an identifier dated inside a span the creator has stated or
+    /// confirmed is verified without a request.
     keys: HashMap<String, Vec<HeldKey>>,
     /// How many keys are held across every end point.
     held: usize,
@@ -189,30 +232,81 @@ struct Cache {
 }
 
 impl Cache {
-    /// The key held for the end point whose confirmed span covers the
-    /// minute, if any held key does.
-    fn held_pem(&self, end_point: &str, minute: u32) -> Option<String> {
+    /// The key held for the end point that is known to cover the minute, if
+    /// any. A minute within the drift allowance of now is only served where
+    /// the creator itself stated the span, because a span confirmed minute
+    /// by minute says nothing certain about such a minute.
+    fn held_for(&self, end_point: &str, minute: u32, recent: bool) -> Option<KeyAnswer> {
         self.keys
             .get(end_point)?
             .iter()
-            .find(|key| key.covers(minute))
-            .map(|key| key.pem.clone())
+            .find(|key| key.covers(minute) && (key.explicit || !recent))
+            .map(|key| KeyAnswer {
+                pem: key.pem.clone(),
+                first: key.first,
+                last: key.last,
+                known: true,
+            })
     }
 
-    /// Records that the creator answered the minute with the key.
+    /// Records the creator's answer, being the key and, where the creator
+    /// stated it, the span the key covers as the minute it came into force
+    /// and the minute the next key starts. Returns the key with the span it
+    /// is now known to cover.
     ///
-    /// A key already held for the end point has its span widened to take in
-    /// the minute. A key not held before is added, emptying the cache first
-    /// when it is full, because the domains and dates asked about come from
-    /// the identifiers presented to this process and the cache must not grow
-    /// on their input.
-    fn hold(&mut self, end_point: &str, minute: u32, pem: &str) {
+    /// With both the start and the end the whole span is held as the
+    /// creator's own statement. With the start alone the key is held from
+    /// the start up to the drift allowance behind now, because no later key
+    /// can have started before then. With neither the minute asked about is
+    /// held on its own, as long as it is not within the drift allowance of
+    /// now. A key already held for the end point has its span widened to
+    /// take in the new one. A key not held before is added, emptying the
+    /// cache first when it is full, because the domains and dates asked
+    /// about come from the identifiers presented to this process and the
+    /// cache must not grow on their input.
+    fn hold(
+        &mut self,
+        end_point: &str,
+        minute: Option<u32>,
+        recent: bool,
+        pem: &str,
+        start: Option<u32>,
+        end: Option<u32>,
+    ) -> KeyAnswer {
+        let (first, last, explicit) = match (start, end, minute) {
+            (Some(start), Some(end), _) if end > start => (start, end - 1, true),
+            (Some(start), _, _) => {
+                let now = minutes_since_base(&Utc::now()).unwrap_or(u32::MAX);
+                (
+                    start,
+                    start.max(now.saturating_sub(CLOCK_DRIFT_ALLOWANCE_MINUTES)),
+                    false,
+                )
+            }
+            (None, _, Some(minute)) if !recent => (minute, minute, false),
+            _ => return KeyAnswer::unknown(pem),
+        };
         if let Some(keys) = self.keys.get_mut(end_point) {
-            let same = keys.iter().position(|key| key.pem == pem);
-            if let Some(index) = same {
-                if widen(keys, index, minute) {
-                    return;
+            if let Some(index) = keys.iter().position(|key| key.pem == pem) {
+                if widen(keys, index, first, last) {
+                    keys[index].explicit |= explicit;
+                    return KeyAnswer {
+                        pem: pem.to_owned(),
+                        first: keys[index].first,
+                        last: keys[index].last,
+                        known: true,
+                    };
                 }
+                // The creator has answered with another key inside this span
+                // before, which it does not do unless it went back to a key
+                // it had left. Nothing more is held about this key.
+                return KeyAnswer::unknown(pem);
+            }
+            if keys
+                .iter()
+                .any(|other| other.last >= first && other.first <= last)
+            {
+                return KeyAnswer::unknown(pem);
             }
         }
         if self.held >= MAXIMUM_CACHED_KEYS {
@@ -224,40 +318,39 @@ impl Cache {
             .or_default()
             .push(HeldKey {
                 pem: pem.to_owned(),
-                first: minute,
-                last: minute,
+                first,
+                last,
+                explicit,
             });
         self.held += 1;
+        KeyAnswer {
+            pem: pem.to_owned(),
+            first,
+            last,
+            known: true,
+        }
     }
 }
 
-/// Widens the span of the key at the index to take in the minute, and says
-/// whether the minute is now within it.
+/// Widens the span of the key at the index to take in the span given, and
+/// says whether it did.
 ///
 /// The span is not widened across a minute the creator has answered with
 /// another key for, because that would mean the creator had gone back to a
 /// key it had left, and the minutes between the two spans are then not this
-/// key's to claim. The key is held again as a separate span instead.
-fn widen(keys: &mut [HeldKey], index: usize, minute: u32) -> bool {
-    let key = &keys[index];
-    if key.covers(minute) {
-        return true;
-    }
-    let from = minute.min(key.first);
-    let to = minute.max(key.last);
+/// key's to claim.
+fn widen(keys: &mut [HeldKey], index: usize, first: u32, last: u32) -> bool {
+    let first = first.min(keys[index].first);
+    let last = last.max(keys[index].last);
     let another_between = keys
         .iter()
         .enumerate()
-        .any(|(i, other)| i != index && other.last > from && other.first < to);
+        .any(|(i, other)| i != index && other.last >= first && other.first <= last);
     if another_between {
         return false;
     }
-    let key = &mut keys[index];
-    if minute < key.first {
-        key.first = minute;
-    } else {
-        key.last = minute;
-    }
+    keys[index].first = first;
+    keys[index].last = last;
     true
 }
 
@@ -267,25 +360,22 @@ fn end_point_of(url: &str) -> &str {
     url.split_once('?').map_or(url, |(end_point, _)| end_point)
 }
 
-/// The minute the cache reads the URL as asking about, or `None` where the
-/// cache must not be used for the request.
-///
-/// The date parameter where the URL carries one and it is at least
-/// [`CLOCK_DRIFT_ALLOWANCE_MINUTES`] behind now. A request without a date
-/// asks for the key in force now, and one dated within the allowance, or
-/// later, may be read by the creator as its present rather than as the
-/// minute named, so neither is served from the cache nor held in it.
+/// The minute the URL asks about, or `None` where it names none.
 fn minute_of(url: &str) -> Option<u32> {
-    let oldest_recent =
-        minutes_since_base(&Utc::now())?.checked_sub(CLOCK_DRIFT_ALLOWANCE_MINUTES)?;
-    let minute = url
-        .split_once('?')?
+    url.split_once('?')?
         .1
         .split('&')
         .find_map(|pair| pair.strip_prefix("date="))?
         .parse::<u32>()
-        .ok()?;
-    (minute <= oldest_recent).then_some(minute)
+        .ok()
+}
+
+/// Whether the minute lies within the clock drift allowance of now or later,
+/// which is a minute a creator that does not state its spans may have read
+/// as its present rather than as the minute named.
+fn recent(minute: u32) -> bool {
+    let now = minutes_since_base(&Utc::now()).unwrap_or(u32::MAX);
+    minute > now.saturating_sub(CLOCK_DRIFT_ALLOWANCE_MINUTES)
 }
 
 /// Locks the cache shared by every verification in the process. A panic
@@ -335,7 +425,7 @@ struct InFlightState {
     /// through, so that the callers waiting make the request themselves.
     /// A failure is carried as its message because [`Error`] is not
     /// `Clone`.
-    outcome: Option<std::result::Result<String, String>>,
+    outcome: Option<std::result::Result<KeyAnswer, FetchFailure>>,
     /// The callers waiting for the fetch to end.
     wakers: Vec<Waker>,
 }
@@ -355,7 +445,7 @@ impl InFlight {
 struct Finished<'a>(&'a InFlight);
 
 impl Future for Finished<'_> {
-    type Output = Option<std::result::Result<String, String>>;
+    type Output = Option<std::result::Result<KeyAnswer, FetchFailure>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = self.0.lock();
@@ -375,7 +465,7 @@ impl Future for Finished<'_> {
 struct Leader<'a> {
     url: &'a str,
     in_flight: Arc<InFlight>,
-    outcome: Option<std::result::Result<String, String>>,
+    outcome: Option<std::result::Result<KeyAnswer, FetchFailure>>,
 }
 
 impl Drop for Leader<'_> {
@@ -427,15 +517,20 @@ pub fn public_key_url(owid: &Owid, scheme: &str) -> String {
 }
 
 /// Makes the request through the transport and reads the answer, taking
-/// only a 200 as the key.
+/// only a 200 with the JSON form the specification requires as the key.
 ///
 /// A redirect is refused here, whatever the transport, so a creator whose
 /// domain answers 3xx has its key reported as unavailable and nothing is
 /// ever requested from wherever the redirect pointed. See
 /// [`PublicKeyFetch`] for why. Any other status without the key, a 404 for
 /// a date the creator cannot serve for example, reaches the caller the same
-/// way, as the key being unavailable, which it is.
-async fn request_public_key(fetch: &dyn PublicKeyFetch, url: &str) -> Result<String> {
+/// way, as the key being unavailable, which it is. A body that is not the
+/// JSON form, the PEM alone among the other forms, or that fails the checks
+/// a creator applies before sending it, is a key that cannot be read.
+async fn request_public_key(
+    fetch: &dyn PublicKeyFetch,
+    url: &str,
+) -> Result<(String, Option<u32>, Option<u32>)> {
     let response = fetch.fetch(url).await?;
     if (300..400).contains(&response.status) {
         return Err(Error::Http(format!(
@@ -449,23 +544,44 @@ async fn request_public_key(fetch: &dyn PublicKeyFetch, url: &str) -> Result<Str
             response.status
         )));
     }
-    Ok(response.body)
+    let answer = PublicKeyAnswer::parse(&response.body)?;
+    answer.validate(None)?;
+    Ok((
+        answer.public_key_spki,
+        answer
+            .valid_from
+            .and_then(|moment| minutes_since_base(&moment)),
+        answer
+            .valid_to
+            .and_then(|moment| minutes_since_base(&moment)),
+    ))
 }
 
-/// Fetches the public key PEM for the URL, from the cache when the creator
-/// has already confirmed a key for the minute the URL names, from a fetch
-/// already under way for the same URL when there is one, and otherwise
-/// through the transport.
+/// Fetches the public key PEM for the URL. See [`key_at_url`].
+#[cfg(test)]
 async fn public_key_pem(fetch: &dyn PublicKeyFetch, url: &str) -> Result<String> {
+    Ok(key_at_url(fetch, url).await?.pem)
+}
+
+/// Fetches the key the URL asks for, with the span it is known to cover.
+/// Answered from the cache where a held key is known to cover the minute the
+/// URL names, from a fetch already under way for the same URL where there is
+/// one, and otherwise through the transport. The creator's answer states the
+/// moments the key is valid from and to, so the whole span is held from that
+/// one answer.
+async fn key_at_url(fetch: &dyn PublicKeyFetch, url: &str) -> Result<KeyAnswer> {
     let end_point = end_point_of(url);
     let minute = minute_of(url);
+    let is_recent = minute.is_some_and(recent);
     loop {
         // The lock is taken and released before anything is awaited, so no
         // caller ever holds it across a fetch.
         let turn = {
             let mut held = cache();
-            if let Some(pem) = minute.and_then(|minute| held.held_pem(end_point, minute)) {
-                return Ok(pem);
+            if let Some(answer) =
+                minute.and_then(|minute| held.held_for(end_point, minute, is_recent))
+            {
+                return Ok(answer);
             }
             match held.in_flight.get(url) {
                 Some(in_flight) => Turn::Wait(Arc::clone(in_flight)),
@@ -479,8 +595,8 @@ async fn public_key_pem(fetch: &dyn PublicKeyFetch, url: &str) -> Result<String>
         };
         match turn {
             Turn::Wait(in_flight) => match in_flight.finished().await {
-                Some(Ok(pem)) => return Ok(pem),
-                Some(Err(message)) => return Err(Error::Http(message)),
+                Some(Ok(answer)) => return Ok(answer),
+                Some(Err(failure)) => return Err(failure.into_error()),
                 // The caller making the fetch was dropped before it ended,
                 // so go round again and make it.
                 None => continue,
@@ -491,21 +607,18 @@ async fn public_key_pem(fetch: &dyn PublicKeyFetch, url: &str) -> Result<String>
                     in_flight,
                     outcome: None,
                 };
-                let result = request_public_key(fetch, url).await;
-                leader.outcome = Some(match &result {
-                    Ok(pem) => {
-                        // Held before the leader is dropped, so a caller
-                        // arriving between the two finds the key rather
-                        // than starting a fetch of its own.
-                        if let Some(minute) = minute {
-                            cache().hold(end_point, minute, pem);
-                        }
-                        Ok(pem.clone())
+                let outcome = match request_public_key(fetch, url).await {
+                    // Held before the leader is dropped, so a caller
+                    // arriving between the two finds the key rather than
+                    // starting a fetch of its own.
+                    Ok((pem, start, end)) => {
+                        Ok(cache().hold(end_point, minute, is_recent, &pem, start, end))
                     }
-                    Err(Error::Http(message)) => Err(message.clone()),
-                    Err(other) => Err(other.to_string()),
-                });
-                return result;
+                    Err(Error::Http(message)) => Err(FetchFailure::Http(message)),
+                    Err(other) => Err(FetchFailure::Key(other.to_string())),
+                };
+                leader.outcome = Some(outcome.clone());
+                return outcome.map_err(FetchFailure::into_error);
             }
         }
     }
@@ -519,14 +632,14 @@ impl Owid {
     ///
     /// The request is the one [`public_key_url`] builds, so it names the
     /// minute the OWID was created and a creator that rotates its key
-    /// answers with the key in force then. Only a 200 is taken as the key.
-    /// A redirect is never followed, whatever the transport does, because a
-    /// key from wherever a redirect points is not the creator's key. Keys
-    /// are held against the span of minutes the creator has confirmed them
-    /// for, so an OWID dated inside a confirmed span is verified without a
-    /// request, and a caller that asks for a key while another caller is
-    /// fetching it waits for that fetch.
-    ///
+    /// answers with the key in force then, together with the moments it is
+    /// valid from and to. Only a 200 with that JSON answer is taken as the
+    /// key. A redirect is never followed, whatever the transport does,
+    /// because a key from wherever a redirect points is not the creator's
+    /// key. The key is held for the whole span the creator stated, so an
+    /// OWID dated inside it is verified without a request, and a caller that
+    /// asks for a key while another caller is fetching it waits for that
+    /// fetch.
     /// The future is not `Send`, so it can be driven by a single threaded
     /// host and by a transport tied to one thread, and it needs no
     /// particular runtime.
@@ -569,8 +682,69 @@ impl Owid {
         url: &str,
         others: &[&Owid],
     ) -> Result<bool> {
-        let pem = public_key_pem(fetch, url).await?;
-        self.verify_with_public_key(&pem, others)
+        let answer = key_at_url(fetch, url).await?;
+        if self.verify_with_public_key(&answer.pem, others)? {
+            return Ok(true);
+        }
+        self.neighbour_verifies(fetch, url, &answer, others).await
+    }
+
+    /// Whether a key neighbouring the one the OWID's own minute selected
+    /// verifies the signature instead.
+    ///
+    /// A creator's signing machines may not agree with its own schedule to
+    /// the minute, so an identifier dated just after a key started may have
+    /// been signed with the key before it, and one dated just before may
+    /// have been signed with the key after. Where the signature does not
+    /// verify under the key selected and the OWID's minute is within the
+    /// clock drift allowance of the edge of the span that key is known to
+    /// cover, the key for the minute just beyond that edge is asked for and
+    /// tried. A key already known to cover the neighbouring minute is not
+    /// asked for again, and a neighbour that turns out to be the same key is
+    /// not tried again. This costs at most two more requests, and only for a
+    /// signature that has already failed.
+    async fn neighbour_verifies(
+        &self,
+        fetch: &dyn PublicKeyFetch,
+        url: &str,
+        tried: &KeyAnswer,
+        others: &[&Owid],
+    ) -> Result<bool> {
+        let Some(minute) = minutes_since_base(&self.date()) else {
+            return Ok(false);
+        };
+        if tried.known && !tried.covers(minute) {
+            // The key tried was never in force at the OWID's minute, so the
+            // OWID is not near an edge of that key's span.
+            return Ok(false);
+        }
+        let end_point = end_point_of(url);
+        for at in [
+            minute.checked_sub(CLOCK_DRIFT_ALLOWANCE_MINUTES),
+            minute.checked_add(CLOCK_DRIFT_ALLOWANCE_MINUTES),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if tried.covers(at) {
+                continue;
+            }
+            let Ok(neighbour) =
+                key_at_url(fetch, &format!("{end_point}?date={at}&format=pkcs")).await
+            else {
+                continue;
+            };
+            if neighbour.pem == tried.pem {
+                continue;
+            }
+            if self
+                .verify_with_public_key(&neighbour.pem, others)
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The same check as [`Owid::verify`], answered with the status that
@@ -701,19 +875,42 @@ mod tests {
             .map(str::to_owned)
     }
 
-    /// Answers a public key request the way the cloud controller does. A
-    /// request naming a date is served the key that was in force then, a
-    /// request without one is served the key in force at the moment of the
-    /// request, a date in the future is read as that moment, a date the
-    /// schedule does not reach is a 404, and a date that is not a number is
-    /// a 400.
+    /// What a stand in creator states about the span of the key it answers
+    /// with.
+    #[derive(Clone, Copy)]
+    enum Span {
+        /// The moments the key is valid from and to, as a creator with a
+        /// schedule states them.
+        Stated,
+        /// No moments, as a creator with one key and no schedule states.
+        None,
+        /// The key alone as text, which the specification does not allow.
+        PemOnly,
+    }
+
+    /// The earliest start in the schedule after the key given, or `None` for
+    /// the last key.
+    fn next_start(schedule: &[ScheduledKey], key: &ScheduledKey) -> Option<DateTime<Utc>> {
+        schedule
+            .iter()
+            .filter(|other| other.starts_at > key.starts_at)
+            .map(|other| other.starts_at)
+            .min()
+    }
+
+    /// Answers a public key request the way a creator with a published
+    /// schedule does. A request naming a date is served the key that was in
+    /// force then, a request without one is served the key in force at the
+    /// moment of the request, a date in the future is read as that moment, a
+    /// date the schedule does not reach is a 404, and a date that is not a
+    /// number is a 400. The answer is built and checked with
+    /// [`PublicKeyAnswer`], as a creator built on this crate builds it.
     ///
     /// The moment of the request is fixed at [`request_moment`] so the
     /// tests are repeatable. It sits ten days after the fixture identifier
     /// was signed, so an undated request is served a key other than the one
-    /// that signed it, exactly as it would be against the live creator in
-    /// the week that followed.
-    fn end_point_answer(schedule: &[ScheduledKey], target: &str) -> FetchResponse {
+    /// that signed it.
+    fn end_point_answer(schedule: &[ScheduledKey], target: &str, span: Span) -> FetchResponse {
         let asked = match query_value(target, "date") {
             None => Some(request_moment()),
             Some(minutes) => minutes
@@ -724,7 +921,24 @@ mod tests {
         let key = asked.and_then(|at| key_in_force(schedule, at));
         let (status, body) = match (asked, key) {
             (None, _) => (400, String::new()),
-            (Some(_), Some(key)) => (200, key.pem.clone()),
+            (Some(asked), Some(key)) => match span {
+                Span::PemOnly => (200, key.pem.clone()),
+                Span::None => (
+                    200,
+                    PublicKeyAnswer::new(key.pem.clone(), None, None).to_json(),
+                ),
+                Span::Stated => {
+                    let answer = PublicKeyAnswer::new(
+                        key.pem.clone(),
+                        Some(key.starts_at),
+                        next_start(schedule, key),
+                    );
+                    match answer.validate(Some(asked)) {
+                        Ok(()) => (200, answer.to_json()),
+                        Err(_) => (500, String::new()),
+                    }
+                }
+            },
             (Some(_), None) => (404, String::new()),
         };
         FetchResponse { status, body }
@@ -753,10 +967,15 @@ mod tests {
         }
 
         /// A stand in for the creator public key end point, answering the
-        /// way the cloud controller does. See [`end_point_answer`].
+        /// way a creator with a schedule does. See [`end_point_answer`].
         fn end_point() -> Stub {
+            Stub::end_point_stating(Span::Stated)
+        }
+
+        /// A stand in creator stating what it does about spans.
+        fn end_point_stating(span: Span) -> Stub {
             let schedule = schedule();
-            Stub::new(move |url| Ok(end_point_answer(&schedule, url)))
+            Stub::new(move |url| Ok(end_point_answer(&schedule, url, span)))
         }
 
         /// Every URL requested so far, in order.
@@ -937,7 +1156,7 @@ mod tests {
     async fn a_minute_between_two_confirmed_minutes_is_served_from_the_cache() {
         let _serialised = CACHE_TESTS.lock().await;
         clear_cache();
-        let stub = Stub::end_point();
+        let stub = Stub::end_point_stating(Span::None);
         // The week of 31 August 2026, which the fixture identifier was
         // signed in, and which is wholly in the past so the cache reads each
         // minute as itself rather than as now.
@@ -996,7 +1215,7 @@ mod tests {
     async fn a_hundred_identifiers_in_one_confirmed_period_make_no_request() {
         let _serialised = CACHE_TESTS.lock().await;
         clear_cache();
-        let stub = Stub::end_point();
+        let stub = Stub::end_point_stating(Span::None);
         let start = minutes_at("2026-09-01T00:00:00Z");
         pem_at(&stub, "stub-hundred", start).await;
         pem_at(&stub, "stub-hundred", start + 100).await;
@@ -1020,7 +1239,7 @@ mod tests {
         let _serialised = CACHE_TESTS.lock().await;
         clear_cache();
         let schedule = schedule();
-        let stub = Stub::end_point();
+        let stub = Stub::end_point_stating(Span::None);
         let rotation = minutes_at("2026-08-31T00:00:00Z");
         let week = 7 * 24 * 60;
         // The start of the week before the rotation and the end of the week
@@ -1085,13 +1304,12 @@ mod tests {
     /// about every time and never held, because a creator whose clock
     /// differs from this one's may have read it as its present rather than
     /// as the minute named. A minute beyond the allowance is held as usual.
-    /// Live identifiers therefore cost one request per minute per creator,
-    /// as they always did, and older ones cost none.
+    /// Live identifiers therefore cost one request per minute per creator and older ones cost none.
     #[tokio::test]
     async fn a_minute_within_the_drift_allowance_is_not_held() {
         let _serialised = CACHE_TESTS.lock().await;
         clear_cache();
-        let stub = Stub::end_point();
+        let stub = Stub::end_point_stating(Span::None);
         let started = minutes_since_base(&Utc::now()).expect("should count now");
         let recent = started - 1;
         pem_at(&stub, "stub-drift", recent).await;
@@ -1132,11 +1350,25 @@ mod tests {
     async fn the_cache_is_bounded() {
         let _serialised = CACHE_TESTS.lock().await;
         clear_cache();
-        let stub = Stub::new(|url| {
+        // A real key for every minute, because the client checks each
+        // answer the way a creator does before sending it.
+        let distinct: Mutex<std::collections::HashMap<String, String>> =
+            Mutex::new(Default::default());
+        let stub = Stub::new(move |url| {
             let minute = query_value(url, "date").expect("every request here is dated");
+            let pem = distinct
+                .lock()
+                .expect("should lock the keys")
+                .entry(minute)
+                .or_insert_with(|| {
+                    Crypto::new()
+                        .public_key_pem()
+                        .expect("should export the key")
+                })
+                .clone();
             Ok(FetchResponse {
                 status: 200,
-                body: format!("-----BEGIN PUBLIC KEY-----\n{minute}\n-----END PUBLIC KEY-----\n"),
+                body: PublicKeyAnswer::new(pem, None, None).to_json(),
             })
         });
         for minute in 0..=MAXIMUM_CACHED_KEYS {
@@ -1151,6 +1383,267 @@ mod tests {
             held_keys() <= MAXIMUM_CACHED_KEYS,
             "held {} of at most {MAXIMUM_CACHED_KEYS}",
             held_keys()
+        );
+    }
+
+    /// A creator that states the moments the key is valid from and to has
+    /// the whole span held from that one answer, so every other minute of
+    /// the span is served without a request.
+    #[tokio::test]
+    async fn a_key_answered_with_its_span_is_held_for_the_whole_span() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let stub = Stub::end_point();
+        let pem = pem_at(&stub, "stub-stated", minutes_at("2026-08-31T00:01:00Z")).await;
+        for moment in [
+            "2026-09-06T23:59:00Z",
+            "2026-09-03T12:00:00Z",
+            "2026-08-31T00:00:00Z",
+        ] {
+            assert_eq!(
+                pem_at(&stub, "stub-stated", minutes_at(moment)).await,
+                pem,
+                "{moment}"
+            );
+        }
+        assert_eq!(
+            stub.requests().len(),
+            1,
+            "the whole week was held from one answer"
+        );
+        assert_eq!(held_keys_at("stub-stated"), 1);
+        assert_ne!(
+            pem_at(&stub, "stub-stated", minutes_at("2026-08-30T23:59:00Z")).await,
+            pem,
+            "the minute before the week is the earlier week's key"
+        );
+        pem_at(&stub, "stub-stated", minutes_at("2026-08-24T00:00:00Z")).await;
+        assert_eq!(
+            stub.requests().len(),
+            2,
+            "the earlier week was held from its one answer"
+        );
+    }
+
+    /// The drift allowance, which keeps minutes near now out of a cache
+    /// built from confirmed minutes, does not apply to a span the creator
+    /// stated itself, so live identifiers cost one request per key rather
+    /// than one per minute.
+    #[tokio::test]
+    async fn a_recent_minute_is_served_where_the_creator_stated_the_span() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let schedule = schedule();
+        let now = Utc::now();
+        let Some(current) = key_in_force(&schedule, now) else {
+            return;
+        };
+        if next_start(&schedule, current).is_none() {
+            // The fixture schedule has no key after the one in force now.
+            return;
+        }
+        let stub = Stub::end_point();
+        let started = minutes_since_base(&now).expect("should count now");
+        pem_at(&stub, "stub-recent", started - 1).await;
+        pem_at(&stub, "stub-recent", started).await;
+        pem_at(&stub, "stub-recent", started - 10).await;
+        assert_eq!(
+            stub.requests().len(),
+            1,
+            "the current key was served for every recent minute from one answer"
+        );
+    }
+
+    /// An identifier for the domain dated at the minute and signed with the
+    /// crypto given, standing for one whose signing machine's clock did not
+    /// agree with the creator's schedule to the minute.
+    fn signed_at(domain: &str, minutes: u32, crypto: &Crypto) -> Owid {
+        let mut owid = Owid::from_parts(
+            Version::Version3,
+            domain.to_owned(),
+            base_date() + Duration::minutes(i64::from(minutes)),
+            b"payload".to_vec(),
+            Vec::new(),
+        );
+        let data = owid
+            .data_for_crypto(&[])
+            .expect("should gather the signed bytes");
+        owid.set_signature(crypto.sign_byte_array(&data).expect("should sign"));
+        owid
+    }
+
+    /// An identifier dated just after a key started, but signed with the
+    /// key before it, verifies, and one dated just before a key started but
+    /// signed with it verifies too, because the neighbouring key is tried
+    /// when the selected key fails within the drift allowance of the span's
+    /// edge. Further from the edge the failure stands. The stand in creator
+    /// answers with the crate's own answer type, checked as a creator checks
+    /// it, so the loop between the two halves of the crate is closed.
+    #[tokio::test]
+    async fn a_signature_failing_near_the_edge_of_a_span_is_checked_against_the_neighbour() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let first = Crypto::new();
+        let second = Crypto::new();
+        let third = Crypto::new();
+        let rotation = minutes_at("2026-08-31T00:00:00Z");
+        let week = 7 * 24 * 60;
+        let local = vec![
+            ScheduledKey {
+                starts_at: base_date() + Duration::minutes(i64::from(rotation - week)),
+                pem: first.public_key_pem().unwrap(),
+            },
+            ScheduledKey {
+                starts_at: base_date() + Duration::minutes(i64::from(rotation)),
+                pem: second.public_key_pem().unwrap(),
+            },
+            ScheduledKey {
+                starts_at: base_date() + Duration::minutes(i64::from(rotation + week)),
+                pem: third.public_key_pem().unwrap(),
+            },
+        ];
+        let stub = Stub::new(move |url| Ok(end_point_answer(&local, url, Span::Stated)));
+        let late = signed_at("creator.test", rotation + 5, &first);
+        assert_eq!(
+            late.verify_status(&stub, "stub-edge", &[]).await,
+            SignatureStatus::Valid,
+            "signed with the earlier key just after the rotation"
+        );
+        assert_eq!(
+            stub.requests().len(),
+            2,
+            "the selected key and then the earlier key were asked for"
+        );
+        let early = signed_at("creator.test", rotation - 5, &second);
+        assert_eq!(
+            early.verify_status(&stub, "stub-edge", &[]).await,
+            SignatureStatus::Valid,
+            "signed with the later key just before the rotation"
+        );
+        assert_eq!(
+            stub.requests().len(),
+            2,
+            "both keys are held with their spans"
+        );
+        let far = signed_at("creator.test", rotation + 20, &first);
+        assert_eq!(
+            far.verify_status(&stub, "stub-edge", &[]).await,
+            SignatureStatus::Invalid,
+            "well inside the later key's span"
+        );
+        assert_eq!(
+            stub.requests().len(),
+            2,
+            "the neighbouring minutes lie inside the spans held"
+        );
+        let genuine = signed_at("creator.test", rotation + 3 * 24 * 60, &second);
+        assert_eq!(
+            genuine.verify_status(&stub, "stub-edge", &[]).await,
+            SignatureStatus::Valid
+        );
+        let forged = signed_at("creator.test", rotation + 3 * 24 * 60, &third);
+        assert_eq!(
+            forged.verify_status(&stub, "stub-edge", &[]).await,
+            SignatureStatus::Invalid,
+            "signed with a key not in force at its date"
+        );
+    }
+
+    /// The PEM alone as text is reported as a key this crate cannot read
+    /// rather than used, and so is a span that ends before it starts.
+    #[tokio::test]
+    async fn an_answer_that_is_not_the_json_form_is_a_key_that_cannot_be_read() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let owid = identifier();
+        let pem_only = Stub::end_point_stating(Span::PemOnly);
+        assert_eq!(
+            owid.verify_status(&pem_only, "stub-pem-only", &[]).await,
+            SignatureStatus::InvalidKey
+        );
+        let pem = schedule()[0].pem.clone();
+        let contradictory = Stub::new(move |_| {
+            Ok(FetchResponse {
+                status: 200,
+                body: PublicKeyAnswer::new(
+                    pem.clone(),
+                    Some(
+                        base_date()
+                            + Duration::minutes(i64::from(minutes_at("2026-08-31T00:00:00Z"))),
+                    ),
+                    Some(
+                        base_date()
+                            + Duration::minutes(i64::from(minutes_at("2026-08-24T00:00:00Z"))),
+                    ),
+                )
+                .to_json(),
+            })
+        });
+        assert_eq!(
+            owid.verify_status(&contradictory, "stub-contradictory", &[])
+                .await,
+            SignatureStatus::InvalidKey
+        );
+    }
+
+    /// Threads verifying the same OWID at the same moment, each driving its
+    /// own runtime, make one request for its key between them, and every one
+    /// of them gets the answer. The stand in creator holds its answer until
+    /// every thread has asked, so all of them are in flight together against
+    /// one request.
+    #[test]
+    fn many_threads_verifying_one_owid_together_make_one_request() {
+        let _serialised = CACHE_TESTS.blocking_lock();
+        clear_cache();
+        const CALLERS: usize = 8;
+        let owid = identifier();
+        let pem = key_in_force(&schedule(), owid.date())
+            .expect("the schedule should reach the fixture")
+            .pem
+            .clone();
+        // Passed by the one thread making the request and by this thread
+        // once every caller has started.
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let answering = Arc::clone(&release);
+        let stub = Arc::new(Stub::new(move |_| {
+            // Held until every thread has asked, which the barrier below
+            // guarantees before the request is answered.
+            answering.wait();
+            Ok(FetchResponse {
+                status: 200,
+                body: PublicKeyAnswer::new(pem.clone(), None, None).to_json(),
+            })
+        }));
+        let start = Arc::new(std::sync::Barrier::new(CALLERS));
+        let threads: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let stub = Arc::clone(&stub);
+                let start = Arc::clone(&start);
+                let owid = owid.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("should build a runtime")
+                        .block_on(owid.verify_status(&*stub, "stub-threads", &[]))
+                })
+            })
+            .collect();
+        // One thread makes the request and blocks in the stub until this
+        // barrier is passed, while every other thread waits on that request.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        release.wait();
+        for thread in threads {
+            assert_eq!(
+                thread.join().expect("the thread should finish"),
+                SignatureStatus::Valid,
+                "every thread verified the OWID"
+            );
+        }
+        assert_eq!(
+            stub.requests().len(),
+            1,
+            "one request for {CALLERS} threads"
         );
     }
 
@@ -1279,7 +1772,7 @@ mod tests {
                         body: String::new(),
                     })
                 } else {
-                    Ok(end_point_answer(&schedule, url))
+                    Ok(end_point_answer(&schedule, url, Span::Stated))
                 }
             }
         });
@@ -1446,7 +1939,7 @@ mod tests {
                 tokio::task::yield_now().await;
                 Ok(FetchResponse {
                     status: 200,
-                    body: held.as_str().to_owned(),
+                    body: PublicKeyAnswer::new(held.as_str(), None, None).to_json(),
                 })
             })
         }
@@ -1520,7 +2013,7 @@ mod tests {
                         seen.lock()
                             .expect("should lock the record of requests")
                             .push(query_value(&target, "date"));
-                        let answer = end_point_answer(&schedule, &target);
+                        let answer = end_point_answer(&schedule, &target, Span::Stated);
                         let reason = match answer.status {
                             200 => "OK",
                             400 => "Bad Request",
