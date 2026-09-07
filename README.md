@@ -229,13 +229,20 @@ commonly rotate weekly, so an undated request can only verify identifiers
 signed since the most recent rotation. A creator that ignores the parameter
 returns its current key, so every identifier it signed under an earlier key
 reads as not matching, which is why a creator that rotates its key has to
-honour the date. Keys are held against the URL they came from, which names
-the domain, the version and the minute, up to 1024 of them before the cache
-is emptied, and a caller that asks for a key while another caller is
-fetching it waits for that fetch rather than starting a second.
-`clear_cache` empties what is held, which is how a long running process
-drops a key it has learned it should no longer trust, after a creator
-rotates its key following a compromise.
+honour the date.
+
+Keys already fetched are held by creator, each against the span of minutes
+the creator has confirmed it for. A key is in force from the start of its
+period until the next key starts, so a key the creator answers with at two
+minutes was in force at every minute between them, and an identifier dated
+inside a confirmed span is verified without a request whichever minute it
+carries. One dated outside every span is asked about, which widens the span
+when the same key comes back. At most 1024 keys are held across every
+creator before the cache is emptied and filled again, and a caller that asks
+for a key while another caller is fetching it waits for that fetch rather
+than starting a second. `clear_cache` empties what is held, which is how a
+long running process drops a key it has learned it should no longer trust,
+after a creator rotates its key following a compromise.
 
 ```text
 GET https://[domain]/owid/api/v3/public-key?date=3510720&format=pkcs

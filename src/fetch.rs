@@ -31,14 +31,19 @@
 //!
 //! Keys are cached in memory after the first request, as recommended by the
 //! specification, to avoid repeated requests to the public-key end point of
-//! other processors. A caller that asks for a key while another caller is
-//! already fetching it waits for that fetch rather than starting a second.
+//! other processors. Each key is held against the span of minutes the
+//! creator has confirmed it for, so an identifier dated inside a confirmed
+//! span is verified without a request whichever minute it carries. A caller
+//! that asks for a key while another caller is already fetching it waits for
+//! that fetch rather than starting a second.
 
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+
+use chrono::Utc;
 
 use crate::error::{Error, Result};
 use crate::io::minutes_since_base;
@@ -116,18 +121,159 @@ pub trait PublicKeyFetch: Send + Sync {
     fn fetch<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Result<FetchResponse>>;
 }
 
-/// The most keys held before the cache is emptied and filled again. The key
-/// is the whole URL, which carries the identifier's date, so a verifier that
-/// sees many creators and many periods would otherwise grow the cache for as
+/// The most keys held before the cache is emptied and filled again, across
+/// every creator. A bound is needed because a verifier sees identifiers from
+/// many domains and many weeks, and an unbounded store would grow for as
 /// long as the process runs.
 const MAXIMUM_CACHED_KEYS: usize = 1024;
+
+/// One key a creator has answered with, and the span of minutes the creator
+/// has confirmed it was in force for.
+///
+/// A creator's key is in force from the start of its period until the next
+/// key starts, so a key the creator confirms at two minutes was in force at
+/// every minute between them. The span grows as the creator confirms the
+/// same key for more minutes, and an identifier dated inside it is verified
+/// without a request.
+struct HeldKey {
+    /// The key in PEM form, as the creator served it.
+    pem: String,
+    /// The earliest minute the creator has confirmed the key for.
+    first: u32,
+    /// The latest minute the creator has confirmed the key for.
+    last: u32,
+}
+
+impl HeldKey {
+    /// Whether the minute lies within the confirmed span.
+    fn covers(&self, minute: u32) -> bool {
+        self.first <= minute && minute <= self.last
+    }
+}
 
 /// The keys already obtained, and the fetches under way that a later caller
 /// for the same URL waits on rather than repeating.
 #[derive(Default)]
 struct Cache {
-    keys: HashMap<String, String>,
+    /// Keys already fetched, by the creator's key end point, which is the
+    /// key URL without its date. Each end point holds the keys the creator
+    /// has answered with, each with the span of minutes the creator has
+    /// confirmed it for.
+    ///
+    /// The key URL carries the date of the identifier being verified, in
+    /// minutes, and a creator's key changes on the order of a week. Keyed by
+    /// the whole URL, as this cache once was, two identifiers signed a minute
+    /// apart never shared an entry, so a hundred identifiers over a hundred
+    /// minutes made a hundred requests for one key. Keyed by end point and
+    /// span, an identifier dated between two minutes the creator has already
+    /// answered for is verified without a request.
+    keys: HashMap<String, Vec<HeldKey>>,
+    /// How many keys are held across every end point.
+    held: usize,
     in_flight: HashMap<String, Arc<InFlight>>,
+}
+
+impl Cache {
+    /// The key held for the end point whose confirmed span covers the
+    /// minute, if any held key does.
+    fn held_pem(&self, end_point: &str, minute: u32) -> Option<String> {
+        self.keys
+            .get(end_point)?
+            .iter()
+            .find(|key| key.covers(minute))
+            .map(|key| key.pem.clone())
+    }
+
+    /// Records that the creator answered the minute with the key.
+    ///
+    /// A key already held for the end point has its span widened to take in
+    /// the minute. A key not held before is added, emptying the cache first
+    /// when it is full, because the domains and dates asked about come from
+    /// the identifiers presented to this process and the cache must not grow
+    /// on their input.
+    fn hold(&mut self, end_point: &str, minute: u32, pem: &str) {
+        if let Some(keys) = self.keys.get_mut(end_point) {
+            let same = keys.iter().position(|key| key.pem == pem);
+            if let Some(index) = same {
+                if widen(keys, index, minute) {
+                    return;
+                }
+            }
+        }
+        if self.held >= MAXIMUM_CACHED_KEYS {
+            self.keys.clear();
+            self.held = 0;
+        }
+        self.keys
+            .entry(end_point.to_owned())
+            .or_default()
+            .push(HeldKey {
+                pem: pem.to_owned(),
+                first: minute,
+                last: minute,
+            });
+        self.held += 1;
+    }
+}
+
+/// Widens the span of the key at the index to take in the minute, and says
+/// whether the minute is now within it.
+///
+/// The span is not widened across a minute the creator has answered with
+/// another key for, because that would mean the creator had gone back to a
+/// key it had left, and the minutes between the two spans are then not this
+/// key's to claim. The key is held again as a separate span instead.
+fn widen(keys: &mut [HeldKey], index: usize, minute: u32) -> bool {
+    let key = &keys[index];
+    if key.covers(minute) {
+        return true;
+    }
+    let from = minute.min(key.first);
+    let to = minute.max(key.last);
+    let another_between = keys
+        .iter()
+        .enumerate()
+        .any(|(i, other)| i != index && other.last > from && other.first < to);
+    if another_between {
+        return false;
+    }
+    let key = &mut keys[index];
+    if minute < key.first {
+        key.first = minute;
+    } else {
+        key.last = minute;
+    }
+    true
+}
+
+/// The key URL without its query, which names the scheme, the creator and
+/// the version, and so the key end point being asked.
+fn end_point_of(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(end_point, _)| end_point)
+}
+
+/// The minute the cache reads the URL as asking about.
+///
+/// The date parameter where the URL carries one, and otherwise now, because
+/// a creator answers a request without a date with the key in force now. A
+/// date later than now is read as now as well, because that is how a
+/// creator reads it. A schedule is published ahead of time and a key that
+/// has not started has signed nothing, so the creator answers a future date
+/// with the key in force now, and that answer must be held against now
+/// rather than against a minute the creator has not spoken for. Held against
+/// the future minute, the key would still be served for that minute after
+/// the creator had rotated, and a genuine identifier signed then would read
+/// as not matching.
+fn minute_of(url: &str) -> u32 {
+    let now = minutes_since_base(&Utc::now()).unwrap_or(u32::MAX);
+    url.split_once('?')
+        .and_then(|(_, query)| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("date="))
+                .and_then(|minutes| minutes.parse::<u32>().ok())
+        })
+        .map_or(now, |minute| minute.min(now))
 }
 
 /// Locks the cache shared by every verification in the process. A panic
@@ -157,17 +303,8 @@ fn cache() -> MutexGuard<'static, Cache> {
 pub fn clear_cache() {
     let mut held = cache();
     held.keys.clear();
+    held.held = 0;
     held.in_flight.clear();
-}
-
-/// Holds a key against the URL it came from, emptying the cache first when
-/// it is full.
-fn hold(url: &str, pem: &str) {
-    let mut held = cache();
-    if held.keys.len() >= MAXIMUM_CACHED_KEYS {
-        held.keys.clear();
-    }
-    held.keys.insert(url.to_owned(), pem.to_owned());
 }
 
 /// One fetch under way, shared between the caller making it and every
@@ -303,17 +440,20 @@ async fn request_public_key(fetch: &dyn PublicKeyFetch, url: &str) -> Result<Str
     Ok(response.body)
 }
 
-/// Fetches the public key PEM for the URL, from the cache when it is held,
-/// from a fetch already under way for the same URL when there is one, and
-/// otherwise through the transport.
+/// Fetches the public key PEM for the URL, from the cache when the creator
+/// has already confirmed a key for the minute the URL names, from a fetch
+/// already under way for the same URL when there is one, and otherwise
+/// through the transport.
 async fn public_key_pem(fetch: &dyn PublicKeyFetch, url: &str) -> Result<String> {
+    let end_point = end_point_of(url);
+    let minute = minute_of(url);
     loop {
         // The lock is taken and released before anything is awaited, so no
         // caller ever holds it across a fetch.
         let turn = {
             let mut held = cache();
-            if let Some(pem) = held.keys.get(url) {
-                return Ok(pem.clone());
+            if let Some(pem) = held.held_pem(end_point, minute) {
+                return Ok(pem);
             }
             match held.in_flight.get(url) {
                 Some(in_flight) => Turn::Wait(Arc::clone(in_flight)),
@@ -345,7 +485,7 @@ async fn public_key_pem(fetch: &dyn PublicKeyFetch, url: &str) -> Result<String>
                         // Held before the leader is dropped, so a caller
                         // arriving between the two finds the key rather
                         // than starting a fetch of its own.
-                        hold(url, pem);
+                        cache().hold(end_point, minute, pem);
                         Ok(pem.clone())
                     }
                     Err(Error::Http(message)) => Err(message.clone()),
@@ -368,8 +508,10 @@ impl Owid {
     /// answers with the key in force then. Only a 200 is taken as the key.
     /// A redirect is never followed, whatever the transport does, because a
     /// key from wherever a redirect points is not the creator's key. Keys
-    /// are held against the URL they came from, and a caller that asks for
-    /// a key while another caller is fetching it waits for that fetch.
+    /// are held against the span of minutes the creator has confirmed them
+    /// for, so an OWID dated inside a confirmed span is verified without a
+    /// request, and a caller that asks for a key while another caller is
+    /// fetching it waits for that fetch.
     ///
     /// The future is not `Send`, so it can be driven by a single threaded
     /// host and by a transport tied to one thread, and it needs no
@@ -690,12 +832,13 @@ mod tests {
         );
     }
 
-    /// Keys are held against the URL they came from, which names the
-    /// minute, so two identifiers from different weeks fetch two different
+    /// Keys are held against the span of minutes the creator confirmed them
+    /// for, so two identifiers from different weeks fetch two different
     /// keys, and a key held for one week never answers for another.
     ///
     /// The scheme is one no other test uses, because the cache is shared by
-    /// every test in the process and is keyed by the whole URL.
+    /// every test in the process and is keyed by the end point, which the
+    /// scheme is part of.
     #[tokio::test]
     async fn keys_are_held_per_request_and_not_per_domain() {
         let _serialised = CACHE_TESTS.lock().await;
@@ -725,6 +868,250 @@ mod tests {
             stub.requests().len(),
             2,
             "a week already held is not asked for again"
+        );
+    }
+
+    /// The minute count for a moment, counted the way the key URL counts it.
+    fn minutes_at(moment: &str) -> u32 {
+        let moment = DateTime::parse_from_rfc3339(moment)
+            .expect("should read the moment")
+            .with_timezone(&Utc);
+        minutes_since_base(&moment).expect("should count the minutes")
+    }
+
+    /// The PEM the fetch answers for an identifier from 51d.es dated at the
+    /// minute, asked through the scheme given.
+    async fn pem_at(stub: &Stub, scheme: &str, minutes: u32) -> String {
+        let owid = crafted(Version::Version3, "51d.es", minutes);
+        public_key_pem(stub, &public_key_url(&owid, scheme))
+            .await
+            .expect("should answer with a key")
+    }
+
+    /// The PEM the published schedule says was in force at the minute.
+    fn in_force_at(schedule: &[ScheduledKey], minutes: u32) -> String {
+        key_in_force(
+            schedule,
+            base_date() + Duration::minutes(i64::from(minutes)),
+        )
+        .expect("the schedule should reach the minute")
+        .pem
+        .clone()
+    }
+
+    /// How many keys the cache holds.
+    fn held_keys() -> usize {
+        cache().held
+    }
+
+    /// A key the creator has confirmed for two minutes is served for every
+    /// minute between them without a request, because a key is in force from
+    /// the start of its period until the next key starts. A minute outside
+    /// every confirmed span is asked about.
+    #[tokio::test]
+    async fn a_minute_between_two_confirmed_minutes_is_served_from_the_cache() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let stub = Stub::end_point();
+        // The week of 31 August 2026, which the fixture identifier was
+        // signed in, and which is wholly in the past so the cache reads each
+        // minute as itself rather than as now.
+        let first = minutes_at("2026-08-31T00:01:00Z");
+        let last = minutes_at("2026-09-06T23:00:00Z");
+        let pem = pem_at(&stub, "stub-span", first).await;
+        assert_eq!(
+            pem_at(&stub, "stub-span", last).await,
+            pem,
+            "one key covers the week"
+        );
+        assert_eq!(
+            stub.requests().len(),
+            2,
+            "the two ends of the span were asked about"
+        );
+        for between in [first + 1, first + 3 * 24 * 60, last - 1] {
+            assert_eq!(
+                pem_at(&stub, "stub-span", between).await,
+                pem,
+                "the key served for minute {between}"
+            );
+        }
+        assert_eq!(
+            stub.requests().len(),
+            2,
+            "a minute between two confirmed minutes is not asked about"
+        );
+        assert_eq!(
+            held_keys(),
+            1,
+            "one key is held however many minutes it covers"
+        );
+        assert_ne!(
+            pem_at(&stub, "stub-span", first - 2).await,
+            pem,
+            "a minute in the week before is the earlier week's key"
+        );
+        assert_eq!(
+            stub.requests().len(),
+            3,
+            "a minute before the span is asked about"
+        );
+        assert_eq!(
+            held_keys(),
+            2,
+            "the earlier week's key is held as a second key"
+        );
+    }
+
+    /// The case that made the cache almost useless when it was keyed by the
+    /// whole URL. A hundred identifiers with a hundred different minutes
+    /// inside one key's period cost a hundred requests then. With the ends
+    /// of the period confirmed they cost none.
+    #[tokio::test]
+    async fn a_hundred_identifiers_in_one_confirmed_period_make_no_request() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let stub = Stub::end_point();
+        let start = minutes_at("2026-09-01T00:00:00Z");
+        pem_at(&stub, "stub-hundred", start).await;
+        pem_at(&stub, "stub-hundred", start + 100).await;
+        for i in 1..=100 {
+            pem_at(&stub, "stub-hundred", start + i).await;
+        }
+        assert_eq!(
+            stub.requests().len(),
+            2,
+            "a hundred identifiers over a hundred minutes made no request once both ends of the span were known"
+        );
+    }
+
+    /// A key is only ever served for a minute inside the span the creator
+    /// has confirmed it for. Where the creator rotated between two confirmed
+    /// minutes, the minutes between them belong to neither key until the
+    /// creator is asked, and every answer agrees with the published
+    /// schedule.
+    #[tokio::test]
+    async fn a_key_is_never_served_for_a_minute_outside_its_confirmed_span() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let schedule = schedule();
+        let stub = Stub::end_point();
+        let rotation = minutes_at("2026-08-31T00:00:00Z");
+        let week = 7 * 24 * 60;
+        // The start of the week before the rotation and the end of the week
+        // after it, so the two keys are held with the rotation between.
+        pem_at(&stub, "stub-rotation", rotation - week).await;
+        pem_at(&stub, "stub-rotation", rotation + week - 1).await;
+        assert_eq!(stub.requests().len(), 2);
+        assert_eq!(held_keys(), 2);
+
+        // Every minute across the rotation, in an order that walks in from
+        // both sides, is answered with the key the schedule gives, whether
+        // from the cache or by asking.
+        let minutes = [
+            rotation - 1,
+            rotation,
+            rotation - 2,
+            rotation + 1,
+            rotation - week / 2,
+            rotation + week / 2,
+            rotation - 3,
+            rotation + 2,
+            rotation - 1,
+            rotation,
+        ];
+        for minute in minutes {
+            assert_eq!(
+                pem_at(&stub, "stub-rotation", minute).await,
+                in_force_at(&schedule, minute),
+                "the key served for minute {minute}"
+            );
+        }
+        assert_eq!(held_keys(), 2, "two keys are held, each with its own span");
+        let asked = stub.requests().len();
+        assert!(
+            asked > 2 && asked < 2 + minutes.len(),
+            "some minutes were asked about and some were served: {asked}"
+        );
+
+        // The minute either side of the rotation is now confirmed, so
+        // nothing across the whole fortnight needs asking.
+        let mut minute = rotation - week;
+        while minute < rotation + week {
+            assert_eq!(
+                pem_at(&stub, "stub-rotation", minute).await,
+                in_force_at(&schedule, minute),
+                "the key served for minute {minute}"
+            );
+            minute += 60;
+        }
+        assert_eq!(
+            stub.requests().len(),
+            asked,
+            "both spans are fully confirmed, so nothing was asked"
+        );
+    }
+
+    /// A date later than now is held against now, because a creator answers
+    /// a future date with the key in force now and a key held against a
+    /// minute the creator has not spoken for would be served for that minute
+    /// after the creator had rotated. Two future dates therefore share one
+    /// request, and so does a request with no date.
+    #[tokio::test]
+    async fn a_future_date_is_held_against_now() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let stub = Stub::end_point();
+        let started = minutes_since_base(&Utc::now()).expect("should count now");
+        let week = 7 * 24 * 60;
+        pem_at(&stub, "stub-future", started + week).await;
+        pem_at(&stub, "stub-future", started + 2 * week).await;
+        public_key_pem(
+            &stub,
+            "stub-future://51d.es/owid/api/v3/public-key?format=pkcs",
+        )
+        .await
+        .expect("should answer with the key in force now");
+        if minutes_since_base(&Utc::now()) != Some(started) {
+            // The minute changed during the test, so the calls were not all
+            // about the same now and the count says nothing.
+            return;
+        }
+        assert_eq!(
+            stub.requests().len(),
+            1,
+            "two future dates and no date are all now, and now was asked about once"
+        );
+    }
+
+    /// The cache does not grow without limit. The number of distinct keys a
+    /// verifier is shown is chosen by whoever presents the identifiers rather
+    /// than by this process, so the stand in creator here answers every
+    /// minute with a different key, which is the worst a creator can do to
+    /// the cache.
+    #[tokio::test]
+    async fn the_cache_is_bounded() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let stub = Stub::new(|url| {
+            let minute = query_value(url, "date").expect("every request here is dated");
+            Ok(FetchResponse {
+                status: 200,
+                body: format!("-----BEGIN PUBLIC KEY-----\n{minute}\n-----END PUBLIC KEY-----\n"),
+            })
+        });
+        for minute in 0..=MAXIMUM_CACHED_KEYS {
+            pem_at(&stub, "stub-bounded", minute as u32).await;
+        }
+        assert_eq!(
+            stub.requests().len(),
+            MAXIMUM_CACHED_KEYS + 1,
+            "every minute was a different key, so every one was asked"
+        );
+        assert!(
+            held_keys() <= MAXIMUM_CACHED_KEYS,
+            "held {} of at most {MAXIMUM_CACHED_KEYS}",
+            held_keys()
         );
     }
 
