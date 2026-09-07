@@ -243,8 +243,10 @@ span comes from a creator with one key and no schedule, and is held against the
 minute asked about and every minute between two such answers for the same key,
 but never for a minute within fifteen minutes of now, because a creator whose
 clock differs from this one's may have read that minute as its present rather
-than as the minute named. The PEM alone as text is not a valid answer and is
-reported as a key that cannot be read. A signature that does not verify under
+than as the minute named. The request asks for the key in the spki encoding by
+name, the one encoding the specification defines. The PEM alone as text is not
+a valid answer and is reported as a key that cannot be read, and so is an
+answer stating another encoding. A signature that does not verify under
 the key selected, where the OWID is dated within fifteen minutes of an edge of
 the span the creator stated for that key, is checked against the key for the
 minute just beyond that edge before it is reported as not matching, because a
@@ -261,7 +263,7 @@ is how a long running process drops a key it has learned it should no longer
 trust, after a creator rotates its key following a compromise.
 
 ```text
-GET https://[domain]/owid/api/v3/public-key?date=3510720&format=pkcs
+GET https://[domain]/owid/api/v3/public-key?date=3510720&format=spki
 ```
 
 Only a 200 is taken as the key. A redirect is never followed, because a key
@@ -316,7 +318,9 @@ use owid::{endpoints, Creator};
 
 fn response(creator: &Creator) -> String {
     // GET /owid/api/v3/public-key?format=spki
-    endpoints::public_key_response(creator, "spki").unwrap()
+    // The format is the one the request asked for, or None where it asked
+    // for none, which is read as spki. Any other value is answered 400.
+    endpoints::public_key_response(creator, Some("spki")).unwrap()
 }
 ```
 
@@ -337,7 +341,7 @@ fn response(creator: &Creator) -> String {
 |`PublicKeyFetch`, `FetchResponse`, `LocalBoxFuture`|The transport that makes the public key request for `Owid::verify`, what it hands back, and the boxed future it answers with, which is not required to be `Send` (`fetch` feature).|
 |`ReqwestFetch`|The ready made transport over asynchronous reqwest with rustls, which never follows a redirect (`reqwest-fetch` feature).|
 |`clear_cache`|Empties the held public keys, so the next verification asks the creator again (`fetch` feature).|
-|`PublicKeyAnswer`|The JSON body of the public key end point, the key with the moments it is valid from and to, read, written and checked the same way by creators and clients.|
+|`PublicKeyAnswer`|The JSON body of the public key end point, the key with the encoding it is in and the moments it is valid from and to, read, written and checked the same way by creators and clients.|
 |`DatedPublicKey`, `PublicKeySchedule`|A creator's published schedule of keys and the rule for the key in force at a moment.|
 |`endpoints::public_key_response_at`, `endpoints::public_key_answer`|The status and JSON body a creator with a schedule answers a public key request with, checked before it is returned (`endpoints` feature).|
 

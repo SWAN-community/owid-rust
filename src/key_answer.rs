@@ -23,21 +23,26 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use crate::crypto::Crypto;
 use crate::error::{Error, Result};
 
-/// The JSON body of the public key end point. It carries the key together
-/// with the moments it is valid from and to, in UTC, so a client holds the
-/// key for the whole span from one answer rather than asking again for every
-/// minute.
+/// The JSON body of the public key end point. It carries the key, the
+/// encoding the key is in, and the moments it is valid from and to, in UTC,
+/// so a client holds the key for the whole span from one answer rather than
+/// asking again for every minute.
 ///
-/// `valid_from` is `None` where the creator has a single key and no schedule,
-/// and `valid_to` is `None` where no later key has been scheduled. Both the
-/// creator that sends the answer and the client that reads it check it with
-/// [`PublicKeyAnswer::validate`], so a fault in a creator's schedule or store
-/// is a server error at the creator rather than a bad answer a client then
-/// has to refuse.
+/// `format` is the encoding of `public_key`, being the value the request
+/// asked for. The only encoding the specification defines is
+/// [`PublicKeyAnswer::SPKI_FORMAT`], a Subject Public Key Info PEM, which a
+/// request that asks for none receives. `valid_from` is `None` where the
+/// creator has a single key and no schedule, and `valid_to` is `None` where
+/// no later key has been scheduled. Both the creator that sends the answer
+/// and the client that reads it check it with [`PublicKeyAnswer::validate`],
+/// so a fault in a creator's schedule or store is a server error at the
+/// creator rather than a bad answer a client then has to refuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicKeyAnswer {
-    /// The key in PEM form.
-    pub public_key_spki: String,
+    /// The encoding of the key, which is the value the request asked for.
+    pub format: String,
+    /// The key in the encoding `format` names.
+    pub public_key: String,
     /// The UTC moment the key came into force, where known.
     pub valid_from: Option<DateTime<Utc>>,
     /// The UTC moment the next key starts, where one is scheduled.
@@ -45,34 +50,46 @@ pub struct PublicKeyAnswer {
 }
 
 impl PublicKeyAnswer {
-    /// An answer for the key and the moments it is valid from and to, not
-    /// yet checked.
+    /// The one encoding of the key this crate reads and writes, a Subject
+    /// Public Key Info PEM, and the encoding a request that names none
+    /// receives.
+    pub const SPKI_FORMAT: &'static str = "spki";
+
+    /// An answer for the key in the `spki` encoding and the moments it is
+    /// valid from and to, not yet checked.
     pub fn new(
-        public_key_spki: impl Into<String>,
+        public_key: impl Into<String>,
         valid_from: Option<DateTime<Utc>>,
         valid_to: Option<DateTime<Utc>>,
     ) -> Self {
         PublicKeyAnswer {
-            public_key_spki: public_key_spki.into(),
+            format: Self::SPKI_FORMAT.to_owned(),
+            public_key: public_key.into(),
             valid_from,
             valid_to,
         }
     }
 
     /// Checks the answer the way both the creator that sends it and the
-    /// client that reads it must. The key must be a public key this crate
-    /// can read, a key valid to a moment must be valid from an earlier one,
-    /// and where the moment asked about is known the key must have come into
-    /// force by then and, if it has an end, not have ended.
+    /// client that reads it must. The format must be the one this crate
+    /// reads and the key must be a public key in it, a key valid to a moment
+    /// must be valid from an earlier one, and where the moment asked about
+    /// is known the key must have come into force by then and, if it has an
+    /// end, not have ended.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Key`] describing the first check that fails.
     pub fn validate(&self, asked: Option<DateTime<Utc>>) -> Result<()> {
-        if self.public_key_spki.trim().is_empty() {
+        if self.format != Self::SPKI_FORMAT {
+            return Err(Error::Key(
+                "the public key answer states a format this crate does not read".to_owned(),
+            ));
+        }
+        if self.public_key.trim().is_empty() {
             return Err(Error::Key("the public key answer holds no key".to_owned()));
         }
-        Crypto::new_verify_only(&self.public_key_spki).map_err(|_| {
+        Crypto::new_verify_only(&self.public_key).map_err(|_| {
             Error::Key("the public key answer holds a key that cannot be read".to_owned())
         })?;
         if let Some(to) = self.valid_to {
@@ -111,8 +128,10 @@ impl PublicKeyAnswer {
     /// The answer as JSON, with the moments as RFC 3339 strings in UTC and
     /// `null` where there is no moment.
     pub fn to_json(&self) -> String {
-        let mut json = String::from("{\"publicKeySPKI\":");
-        write_string(&mut json, &self.public_key_spki);
+        let mut json = String::from("{\"format\":");
+        write_string(&mut json, &self.format);
+        json.push_str(",\"publicKey\":");
+        write_string(&mut json, &self.public_key);
         json.push_str(",\"validFrom\":");
         write_moment(&mut json, self.valid_from);
         json.push_str(",\"validTo\":");
@@ -127,7 +146,9 @@ impl PublicKeyAnswer {
     /// # Errors
     ///
     /// Returns [`Error::Key`] where the body is not a JSON object of the
-    /// three fields, each a string or `null`, or a moment is not RFC 3339.
+    /// four fields, each a string or `null`, or a moment is not RFC 3339.
+    /// A body without `format` is read as the `spki` encoding, which is
+    /// what a request that asks for no format receives.
     pub fn parse(json: &str) -> Result<Self> {
         let fields = read_flat_object(json)?;
         let field = |name: &str| {
@@ -136,9 +157,9 @@ impl PublicKeyAnswer {
                 .find(|(key, _)| key == name)
                 .and_then(|(_, value)| value.clone())
         };
-        let public_key_spki = field("publicKeySPKI").unwrap_or_default();
         Ok(PublicKeyAnswer {
-            public_key_spki,
+            format: field("format").unwrap_or_else(|| Self::SPKI_FORMAT.to_owned()),
+            public_key: field("publicKey").unwrap_or_default(),
             valid_from: moment(field("validFrom"), "validFrom")?,
             valid_to: moment(field("validTo"), "validTo")?,
         })
@@ -183,7 +204,7 @@ fn write_string(json: &mut String, value: &str) {
 
 fn not_json() -> Error {
     Error::Key(
-        "the public key answer is not the JSON object of three fields the specification requires"
+        "the public key answer is not the JSON object of four fields the specification requires"
             .to_owned(),
     )
 }
@@ -308,6 +329,8 @@ mod tests {
             json.contains("\"validFrom\":\"2026-08-31T00:00:00Z\""),
             "{json}"
         );
+        assert!(json.contains("\"format\":\"spki\""), "{json}");
+        assert!(json.contains("\"publicKey\":\"-----BEGIN"), "{json}");
         assert_eq!(PublicKeyAnswer::parse(&json).expect("should read"), answer);
         let spanless = PublicKeyAnswer::new(pem(), None, None);
         assert!(spanless.to_json().contains("\"validFrom\":null"));
@@ -342,6 +365,38 @@ mod tests {
         assert!(
             PublicKeyAnswer::parse(&pem()).is_err(),
             "the PEM alone is not the answer"
+        );
+    }
+
+    /// The format is echoed as stated and checked before the key, an
+    /// encoding other than spki is refused, and an answer without a format
+    /// is read as spki, which is what a request that asks for none receives.
+    #[test]
+    fn a_format_other_than_spki_is_refused_and_an_absent_one_is_spki() {
+        let mut answer = PublicKeyAnswer::new(pem(), None, None);
+        assert_eq!(answer.format, PublicKeyAnswer::SPKI_FORMAT);
+        assert!(answer.validate(None).is_ok());
+        let without = answer.to_json().replacen("\"format\":\"spki\",", "", 1);
+        assert!(!without.contains("format"), "{without}");
+        assert_eq!(
+            PublicKeyAnswer::parse(&without).expect("should read"),
+            answer,
+            "an answer without a format is in the spki encoding"
+        );
+        answer.format = "pkcs".to_owned();
+        assert!(
+            answer.to_json().contains("\"format\":\"pkcs\""),
+            "the format is echoed as stated"
+        );
+        assert_eq!(
+            PublicKeyAnswer::parse(&answer.to_json())
+                .expect("should read")
+                .format,
+            "pkcs"
+        );
+        assert!(
+            answer.validate(None).is_err(),
+            "an encoding this crate does not read is refused"
         );
     }
 }

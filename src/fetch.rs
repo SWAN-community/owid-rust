@@ -563,8 +563,9 @@ pub fn public_key_url(owid: &Owid, scheme: &str) -> String {
     }
 }
 
-/// The query naming the encoding the key is asked for in.
-const FORMAT_QUERY: &str = "format=pkcs";
+/// The query asking for the key as a Subject Public Key Info PEM, being the
+/// one encoding the specification defines and the one this crate reads.
+const FORMAT_QUERY: &str = "format=spki";
 
 /// The URL that asks the key end point for the key in force at the minute.
 fn key_url_at(end_point: &str, minute: u32) -> String {
@@ -580,8 +581,9 @@ fn key_url_at(end_point: &str, minute: u32) -> String {
 /// [`PublicKeyFetch`] for why. Any other status without the key, a 404 for
 /// a date the creator cannot serve for example, reaches the caller the same
 /// way, as the key being unavailable, which it is. A body that is not the
-/// JSON form, the PEM alone among the other forms, or that fails the checks
-/// a creator applies before sending it, is a key that cannot be read.
+/// JSON form, the PEM alone among the other forms, that states an encoding
+/// other than the one asked for, or that fails the checks a creator applies
+/// before sending it, is a key that cannot be read.
 async fn request_public_key(
     fetch: &dyn PublicKeyFetch,
     url: &str,
@@ -602,7 +604,7 @@ async fn request_public_key(
     let answer = PublicKeyAnswer::parse(&response.body)?;
     answer.validate(None)?;
     Ok((
-        answer.public_key_spki,
+        answer.public_key,
         answer
             .valid_from
             .and_then(|moment| minutes_since_base(&moment)),
@@ -1094,7 +1096,7 @@ mod tests {
         let minutes = minutes_since_base(&owid.date()).expect("should count the minutes");
         assert_eq!(
             public_key_url(&owid, "https"),
-            format!("https://example.com/owid/api/v3/public-key?date={minutes}&format=pkcs"),
+            format!("https://example.com/owid/api/v3/public-key?date={minutes}&format=spki"),
             "should build the well known end point URL with the date"
         );
     }
@@ -1133,7 +1135,7 @@ mod tests {
         assert_eq!(
             public_key_url(&owid, "https"),
             format!(
-                "https://example.com/owid/api/v2/public-key?date={IDENTIFIER_MINUTES}&format=pkcs"
+                "https://example.com/owid/api/v2/public-key?date={IDENTIFIER_MINUTES}&format=spki"
             ),
             "should ask the version 2 end point"
         );
@@ -1392,7 +1394,7 @@ mod tests {
         pem_at(&stub, "stub-drift", started + 7 * 24 * 60).await;
         public_key_pem(
             &stub,
-            "stub-drift://51d.es/owid/api/v3/public-key?format=pkcs",
+            "stub-drift://51d.es/owid/api/v3/public-key?format=spki",
         )
         .await
         .expect("should answer with the key in force now");
@@ -1756,6 +1758,32 @@ mod tests {
         );
     }
 
+    /// An answer stating an encoding other than the spki asked for is a key
+    /// this crate cannot read, whatever it carries, because the key is not
+    /// in the form the request named.
+    #[tokio::test]
+    async fn an_answer_in_another_format_is_a_key_that_cannot_be_read() {
+        let _serialised = CACHE_TESTS.lock().await;
+        clear_cache();
+        let owid = identifier();
+        let schedule = schedule();
+        let stub = Stub::new(move |url| {
+            let served = end_point_answer(&schedule, url, Span::Stated);
+            let mut answer =
+                PublicKeyAnswer::parse(&served.body).expect("the stand in answers the JSON form");
+            answer.format = "pkcs".to_owned();
+            Ok(FetchResponse {
+                status: 200,
+                body: answer.to_json(),
+            })
+        });
+        assert_eq!(
+            owid.verify_status(&stub, "stub-format", &[]).await,
+            SignatureStatus::InvalidKey,
+            "a key in an encoding other than the one asked for cannot be read"
+        );
+    }
+
     /// The PEM alone as text is reported as a key this crate cannot read
     /// rather than used, and so is a span that ends before it starts.
     #[tokio::test]
@@ -1860,7 +1888,7 @@ mod tests {
     fn url_names_the_minute_the_identifier_was_created() {
         assert_eq!(
             public_key_url(&identifier(), "https"),
-            format!("https://51d.es/owid/api/v3/public-key?date={IDENTIFIER_MINUTES}&format=pkcs"),
+            format!("https://51d.es/owid/api/v3/public-key?date={IDENTIFIER_MINUTES}&format=spki"),
             "should ask 51d.es for the key in force on 2026-09-04"
         );
     }
@@ -1939,7 +1967,7 @@ mod tests {
         let owid = identifier();
         let stub = Stub::end_point();
         let undated = format!(
-            "stub-undated://{}/owid/api/v{}/public-key?format=pkcs",
+            "stub-undated://{}/owid/api/v{}/public-key?format=spki",
             owid.domain(),
             owid.version().as_byte()
         );
@@ -2003,7 +2031,7 @@ mod tests {
         let before = minutes_since_base(&(schedule()[0].starts_at - Duration::days(14)))
             .expect("should count the minutes");
         let url = format!(
-            "stub-unserved://{}/owid/api/v{}/public-key?date={}&format=pkcs",
+            "stub-unserved://{}/owid/api/v{}/public-key?date={}&format=spki",
             owid.domain(),
             owid.version().as_byte(),
             before
@@ -2331,7 +2359,7 @@ mod tests {
                 }
             });
             let url = format!(
-                "{}/owid/api/v{}/public-key?format=pkcs",
+                "{}/owid/api/v{}/public-key?format=spki",
                 creator,
                 owid.version().as_byte()
             );
@@ -2356,7 +2384,7 @@ mod tests {
             let before = minutes_since_base(&(schedule()[0].starts_at - Duration::days(14)))
                 .expect("should count the minutes");
             let url = format!(
-                "{}/owid/api/v{}/public-key?date={}&format=pkcs",
+                "{}/owid/api/v{}/public-key?date={}&format=spki",
                 server.base,
                 owid.version().as_byte(),
                 before
