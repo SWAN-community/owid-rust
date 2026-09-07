@@ -155,8 +155,8 @@ impl Owid {
         &self.payload
     }
 
-    /// The signature for this OWID and any others provided when it was
-    /// created. See [`Owid::payload`] on why this is a borrow.
+    /// The signature over the fields of this OWID. See [`Owid::payload`] on
+    /// why this is a borrow.
     pub fn signature(&self) -> &[u8] {
         &self.signature
     }
@@ -354,26 +354,15 @@ impl Owid {
         io::write_byte_array(buffer, &self.payload)
     }
 
-    /// Builds the byte array used for signing and verification. Contains the
-    /// fields of this OWID without the signature, followed by the complete
-    /// byte form of each of the others in the order provided.
-    pub(crate) fn data_for_crypto(&self, others: &[&Owid]) -> Result<Vec<u8>> {
-        let mut capacity = self.encoded_len(false)?;
-        for other in others {
-            capacity = capacity.checked_add(other.encoded_len(true)?).ok_or(
-                Error::ImplementationCapacityExceeded {
-                    required: usize::MAX,
-                },
-            )?;
-        }
+    /// The bytes the signature covers, being the fields of this OWID without
+    /// the signature and nothing else.
+    pub(crate) fn signed_bytes(&self) -> Result<Vec<u8>> {
+        let capacity = self.encoded_len(false)?;
         let mut buffer = Vec::new();
         buffer
             .try_reserve_exact(capacity)
             .map_err(|_| Error::ImplementationCapacityExceeded { required: capacity })?;
         self.to_buffer_no_signature(&mut buffer)?;
-        for other in others {
-            other.to_buffer(&mut buffer)?;
-        }
         Ok(buffer)
     }
 
@@ -434,10 +423,8 @@ impl Owid {
         (Utc::now() - self.date).num_minutes()
     }
 
-    /// Verifies this OWID, and any others that were included when it was
-    /// signed, using the crypto instance provided.
-    ///
-    /// Pass an empty slice for `others` when the OWID was signed on its own.
+    /// Verifies the signature of this OWID using the crypto instance
+    /// provided.
     ///
     /// # Errors
     ///
@@ -452,23 +439,23 @@ impl Owid {
     /// let crypto = Crypto::new();
     /// let creator = Creator::new("example.com", crypto.clone()).unwrap();
     /// let owid = creator.create("Hello World").unwrap();
-    /// assert!(owid.verify_with_crypto(&crypto, &[]).unwrap());
+    /// assert!(owid.verify_with_crypto(&crypto).unwrap());
     /// ```
-    pub fn verify_with_crypto(&self, crypto: &Crypto, others: &[&Owid]) -> Result<bool> {
-        let data = self.data_for_crypto(others)?;
+    pub fn verify_with_crypto(&self, crypto: &Crypto) -> Result<bool> {
+        let data = self.signed_bytes()?;
         crypto.verify_byte_array(&data, &self.signature)
     }
 
-    /// Verifies this OWID, and any others that were included when it was
-    /// signed, using the public key in SPKI PEM form provided.
+    /// Verifies the signature of this OWID using the public key in SPKI PEM
+    /// form provided.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Key`] if the PEM is not a valid public key, or any
     /// error from [`Owid::verify_with_crypto`].
-    pub fn verify_with_public_key(&self, public_pem: &str, others: &[&Owid]) -> Result<bool> {
+    pub fn verify_with_public_key(&self, public_pem: &str) -> Result<bool> {
         let crypto = Crypto::new_verify_only(public_pem)?;
-        self.verify_with_crypto(&crypto, others)
+        self.verify_with_crypto(&crypto)
     }
 
     /// The same check as [`Owid::verify_with_crypto`], answered with the
@@ -478,8 +465,8 @@ impl Owid {
     /// match and a check that could not be made matters, because only
     /// [`SignatureStatus::Invalid`] means the identifier should be
     /// distrusted.
-    pub fn verify_status_with_crypto(&self, crypto: &Crypto, others: &[&Owid]) -> SignatureStatus {
-        SignatureStatus::of(self.verify_with_crypto(crypto, others))
+    pub fn verify_status_with_crypto(&self, crypto: &Crypto) -> SignatureStatus {
+        SignatureStatus::of(self.verify_with_crypto(crypto))
     }
 
     /// The same check as [`Owid::verify_with_public_key`], answered with
@@ -501,18 +488,14 @@ impl Owid {
     ///
     /// let pem = crypto.public_key_pem().unwrap();
     /// assert_eq!(
-    ///     owid.verify_status_with_public_key(&pem, &[]),
+    ///     owid.verify_status_with_public_key(&pem),
     ///     SignatureStatus::Valid);
     /// assert_eq!(
-    ///     owid.verify_status_with_public_key("not a PEM", &[]),
+    ///     owid.verify_status_with_public_key("not a PEM"),
     ///     SignatureStatus::InvalidKey);
     /// ```
-    pub fn verify_status_with_public_key(
-        &self,
-        public_pem: &str,
-        others: &[&Owid],
-    ) -> SignatureStatus {
-        SignatureStatus::of(self.verify_with_public_key(public_pem, others))
+    pub fn verify_status_with_public_key(&self, public_pem: &str) -> SignatureStatus {
+        SignatureStatus::of(self.verify_with_public_key(public_pem))
     }
 }
 

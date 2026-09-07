@@ -134,55 +134,6 @@ fn fixtures_roundtrip_byte_exact() {
     }
 }
 
-/// The data used to verify a supplier OWID signed together with another
-/// OWID is the supplier fields without the signature followed by the
-/// complete bytes of the other. This mirrors the data construction in the
-/// JavaScript verify method and the .NET and Go data for crypto functions.
-#[test]
-fn data_for_crypto_layout() {
-    let creator_bytes = decode_unpadded(TEST_CREATOR_OWID);
-    let supplier_bytes = decode_unpadded(TEST_SUPPLIER_OWID);
-    let creator = Owid::from_byte_array(&creator_bytes).expect("should parse the creator");
-    let supplier = Owid::from_byte_array(&supplier_bytes).expect("should parse the supplier");
-
-    // The supplier crypto data must start with the supplier bytes without
-    // the 64 byte signature and end with the complete creator bytes.
-    let data = supplier_verification_data(&supplier, &creator);
-    let no_signature_length = supplier_bytes.len() - 64;
-    assert_eq!(
-        &data[..no_signature_length],
-        &supplier_bytes[..no_signature_length],
-        "data should start with the supplier fields without the signature"
-    );
-    assert_eq!(
-        &data[no_signature_length..],
-        &creator_bytes[..],
-        "data should end with the complete creator bytes"
-    );
-}
-
-/// Builds the same byte sequence that verification uses by writing the
-/// supplier without its signature followed by the complete creator.
-fn supplier_verification_data(supplier: &Owid, creator: &Owid) -> Vec<u8> {
-    // The public API serializes complete OWIDs only, and an OWID cannot be
-    // held without its signature, so the unsigned form is rebuilt here from
-    // the parts in wire order.
-    let mut data = Vec::new();
-    data.push(supplier.version().as_byte());
-    data.extend_from_slice(supplier.domain().as_bytes());
-    data.push(0);
-    let minutes = (supplier.date() - base_date()).num_minutes() as u32;
-    data.extend_from_slice(&minutes.to_le_bytes());
-    data.extend_from_slice(&(supplier.payload().len() as u32).to_le_bytes());
-    data.extend_from_slice(supplier.payload());
-    data.extend_from_slice(
-        &creator
-            .as_byte_array()
-            .expect("should serialize the creator"),
-    );
-    data
-}
-
 /// Decodes base 64 that may have had its padding removed, as the
 /// JavaScript fixtures have.
 fn decode_unpadded(value: &str) -> Vec<u8> {

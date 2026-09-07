@@ -682,10 +682,9 @@ async fn key_at_url(fetch: &dyn PublicKeyFetch, url: &str) -> Result<KeyAnswer> 
 }
 
 impl Owid {
-    /// Verifies this OWID, and any others that were included when it was
-    /// signed, by fetching the public key from the domain associated with
-    /// the OWID through the transport provided. The scheme is normally
-    /// `https`.
+    /// Verifies this OWID by fetching the public key from the domain
+    /// associated with the OWID through the transport provided. The scheme
+    /// is normally `https`.
     ///
     /// The request is the one [`public_key_url`] builds, so it names the
     /// minute the OWID was created and a creator that rotates its key
@@ -705,8 +704,6 @@ impl Owid {
     /// host and by a transport tied to one thread, and it needs no
     /// particular runtime.
     ///
-    /// Pass an empty slice for `others` when the OWID was signed on its own.
-    ///
     /// # Errors
     ///
     /// Returns [`Error::Http`] if the public key can not be fetched, or if
@@ -723,18 +720,13 @@ impl Owid {
     ///
     /// async fn check(fetch: &dyn PublicKeyFetch, encoded: &str) -> SignatureStatus {
     ///     match Owid::from_base64(encoded) {
-    ///         Ok(owid) => owid.verify_status(fetch, "https", &[]).await,
+    ///         Ok(owid) => owid.verify_status(fetch, "https").await,
     ///         Err(_) => SignatureStatus::VerificationError,
     ///     }
     /// }
     /// ```
-    pub async fn verify(
-        &self,
-        fetch: &dyn PublicKeyFetch,
-        scheme: &str,
-        others: &[&Owid],
-    ) -> Result<bool> {
-        self.verify_at_url(fetch, &public_key_url(self, scheme), others)
+    pub async fn verify(&self, fetch: &dyn PublicKeyFetch, scheme: &str) -> Result<bool> {
+        self.verify_at_url(fetch, &public_key_url(self, scheme))
             .await
     }
 
@@ -745,19 +737,15 @@ impl Owid {
         &self,
         fetch: &dyn PublicKeyFetch,
         url: &str,
-        others: &[&Owid],
     ) -> Result<bool> {
         let answer = key_at_url(fetch, url).await?;
-        if self.verify_with_public_key(&answer.pem, others)? {
+        if self.verify_with_public_key(&answer.pem)? {
             return Ok(true);
         }
         let Some(minute) = minutes_since_base(&self.date()) else {
             return Ok(false);
         };
-        if self
-            .neighbour_verifies(fetch, url, minute, &answer, others)
-            .await
-        {
+        if self.neighbour_verifies(fetch, url, minute, &answer).await {
             return Ok(true);
         }
         if answer.known && !answer.covers(minute) {
@@ -791,7 +779,6 @@ impl Owid {
         url: &str,
         minute: u32,
         tried: &KeyAnswer,
-        others: &[&Owid],
     ) -> bool {
         if !tried.known {
             return false;
@@ -811,10 +798,7 @@ impl Owid {
             if neighbour.pem == tried.pem {
                 continue;
             }
-            if self
-                .verify_with_public_key(&neighbour.pem, others)
-                .unwrap_or(false)
-            {
+            if self.verify_with_public_key(&neighbour.pem).unwrap_or(false) {
                 return true;
             }
         }
@@ -832,13 +816,8 @@ impl Owid {
     /// [`SignatureStatus::Invalid`], because an outage, a badly served key
     /// or a key that proves nothing leaves the signature unjudged and
     /// reporting it as invalid would read as an attack.
-    pub async fn verify_status(
-        &self,
-        fetch: &dyn PublicKeyFetch,
-        scheme: &str,
-        others: &[&Owid],
-    ) -> SignatureStatus {
-        SignatureStatus::of(self.verify(fetch, scheme, others).await)
+    pub async fn verify_status(&self, fetch: &dyn PublicKeyFetch, scheme: &str) -> SignatureStatus {
+        SignatureStatus::of(self.verify(fetch, scheme).await)
     }
 }
 
@@ -1542,9 +1521,7 @@ mod tests {
             b"payload".to_vec(),
             Vec::new(),
         );
-        let data = owid
-            .data_for_crypto(&[])
-            .expect("should gather the signed bytes");
+        let data = owid.signed_bytes().expect("should gather the signed bytes");
         owid.set_signature(crypto.sign_byte_array(&data).expect("should sign"));
         owid
     }
@@ -1582,7 +1559,7 @@ mod tests {
         let stub = Stub::new(move |url| Ok(end_point_answer(&local, url, Span::Stated)));
         let late = signed_at("creator.test", rotation + 5, &first);
         assert_eq!(
-            late.verify_status(&stub, "stub-edge", &[]).await,
+            late.verify_status(&stub, "stub-edge").await,
             SignatureStatus::Valid,
             "signed with the earlier key just after the rotation"
         );
@@ -1593,7 +1570,7 @@ mod tests {
         );
         let early = signed_at("creator.test", rotation - 5, &second);
         assert_eq!(
-            early.verify_status(&stub, "stub-edge", &[]).await,
+            early.verify_status(&stub, "stub-edge").await,
             SignatureStatus::Valid,
             "signed with the later key just before the rotation"
         );
@@ -1604,7 +1581,7 @@ mod tests {
         );
         let far = signed_at("creator.test", rotation + 20, &first);
         assert_eq!(
-            far.verify_status(&stub, "stub-edge", &[]).await,
+            far.verify_status(&stub, "stub-edge").await,
             SignatureStatus::Invalid,
             "well inside the later key's span"
         );
@@ -1615,12 +1592,12 @@ mod tests {
         );
         let genuine = signed_at("creator.test", rotation + 3 * 24 * 60, &second);
         assert_eq!(
-            genuine.verify_status(&stub, "stub-edge", &[]).await,
+            genuine.verify_status(&stub, "stub-edge").await,
             SignatureStatus::Valid
         );
         let forged = signed_at("creator.test", rotation + 3 * 24 * 60, &third);
         assert_eq!(
-            forged.verify_status(&stub, "stub-edge", &[]).await,
+            forged.verify_status(&stub, "stub-edge").await,
             SignatureStatus::Invalid,
             "signed with a key not in force at its date"
         );
@@ -1669,7 +1646,7 @@ mod tests {
         });
         let late = signed_at("creator.test", rotation + 5, &first);
         assert_eq!(
-            late.verify_status(&stub, "stub-beyond", &[]).await,
+            late.verify_status(&stub, "stub-beyond").await,
             SignatureStatus::Valid
         );
         assert_eq!(
@@ -1707,7 +1684,7 @@ mod tests {
         });
         let live = signed_at("creator.test", rotation + 2, &first);
         assert_eq!(
-            live.verify_status(&stub, "stub-open", &[]).await,
+            live.verify_status(&stub, "stub-open").await,
             SignatureStatus::Valid,
             "a live identifier signed with the key before the current one verifies"
         );
@@ -1739,20 +1716,17 @@ mod tests {
         let stub = Stub::new(move |_| Ok(answer(&second_pem, Some(rotation), Some(end))));
         let earlier = signed_at("creator.test", rotation - 3 * 24 * 60, &first);
         assert_eq!(
-            earlier.verify_status(&stub, "stub-not-in-force", &[]).await,
+            earlier.verify_status(&stub, "stub-not-in-force").await,
             SignatureStatus::KeyUnavailable,
             "the key answered with was not in force at the identifier's date"
         );
         assert!(
-            earlier
-                .verify(&stub, "stub-not-in-force", &[])
-                .await
-                .is_err(),
+            earlier.verify(&stub, "stub-not-in-force").await.is_err(),
             "the boolean form cannot say false without it reading as a forgery"
         );
         let forged = signed_at("creator.test", rotation + 3 * 24 * 60, &stranger);
         assert_eq!(
-            forged.verify_status(&stub, "stub-not-in-force", &[]).await,
+            forged.verify_status(&stub, "stub-not-in-force").await,
             SignatureStatus::Invalid,
             "a signature failing under the key in force at its date does not match"
         );
@@ -1778,7 +1752,7 @@ mod tests {
             })
         });
         assert_eq!(
-            owid.verify_status(&stub, "stub-format", &[]).await,
+            owid.verify_status(&stub, "stub-format").await,
             SignatureStatus::InvalidKey,
             "a key in an encoding other than the one asked for cannot be read"
         );
@@ -1793,7 +1767,7 @@ mod tests {
         let owid = identifier();
         let pem_only = Stub::end_point_stating(Span::PemOnly);
         assert_eq!(
-            owid.verify_status(&pem_only, "stub-pem-only", &[]).await,
+            owid.verify_status(&pem_only, "stub-pem-only").await,
             SignatureStatus::InvalidKey
         );
         let pem = schedule()[0].pem.clone();
@@ -1815,7 +1789,7 @@ mod tests {
             })
         });
         assert_eq!(
-            owid.verify_status(&contradictory, "stub-contradictory", &[])
+            owid.verify_status(&contradictory, "stub-contradictory")
                 .await,
             SignatureStatus::InvalidKey
         );
@@ -1860,7 +1834,7 @@ mod tests {
                     tokio::runtime::Builder::new_current_thread()
                         .build()
                         .expect("should build a runtime")
-                        .block_on(owid.verify_status(&*stub, "stub-threads", &[]))
+                        .block_on(owid.verify_status(&*stub, "stub-threads"))
                 })
             })
             .collect();
@@ -1908,7 +1882,7 @@ mod tests {
             "the week beginning 31 August covers 4 September"
         );
         assert_eq!(
-            owid.verify_status_with_public_key(&key.pem, &[]),
+            owid.verify_status_with_public_key(&key.pem),
             SignatureStatus::Valid,
             "should verify against the key that signed it"
         );
@@ -1929,7 +1903,7 @@ mod tests {
             "the key in force in the following week starts after the identifier"
         );
         assert_eq!(
-            owid.verify_status_with_public_key(&later.pem, &[]),
+            owid.verify_status_with_public_key(&later.pem),
             SignatureStatus::Invalid,
             "a later week's key should not verify an earlier week's identifier"
         );
@@ -1944,7 +1918,7 @@ mod tests {
         let owid = identifier();
         let stub = Stub::end_point();
         assert!(
-            owid.verify(&stub, "stub-dated", &[])
+            owid.verify(&stub, "stub-dated")
                 .await
                 .expect("should fetch the key and check the signature"),
             "should verify against the key in force when it was signed"
@@ -1972,7 +1946,7 @@ mod tests {
             owid.version().as_byte()
         );
         assert_eq!(
-            SignatureStatus::of(owid.verify_at_url(&stub, &undated, &[]).await),
+            SignatureStatus::of(owid.verify_at_url(&stub, &undated).await),
             SignatureStatus::KeyUnavailable,
             "an undated request gets the key in force at the request, which the creator says was not in force when the identifier was signed"
         );
@@ -2009,7 +1983,7 @@ mod tests {
             }
         });
         assert_eq!(
-            owid.verify_status(&stub, "stub-redirect", &[]).await,
+            owid.verify_status(&stub, "stub-redirect").await,
             SignatureStatus::KeyUnavailable,
             "a redirect is the key being unavailable, never a key from wherever it points"
         );
@@ -2037,7 +2011,7 @@ mod tests {
             before
         );
         assert_eq!(
-            SignatureStatus::of(owid.verify_at_url(&stub, &url, &[]).await),
+            SignatureStatus::of(owid.verify_at_url(&stub, &url).await),
             SignatureStatus::KeyUnavailable,
             "no key means the signature was never examined"
         );
@@ -2049,9 +2023,7 @@ mod tests {
     async fn a_transport_that_obtains_no_answer_is_key_unavailable() {
         let stub = Stub::new(|url| Err(Error::Http(format!("no route to {url}"))));
         assert_eq!(
-            identifier()
-                .verify_status(&stub, "stub-unreachable", &[])
-                .await,
+            identifier().verify_status(&stub, "stub-unreachable").await,
             SignatureStatus::KeyUnavailable,
             "a key that could not be fetched should not read as a forgery"
         );
@@ -2065,8 +2037,8 @@ mod tests {
         let owid = identifier();
         let stub = Stub::end_point();
         let (first, second) = tokio::join!(
-            owid.verify_status(&stub, "stub-shared", &[]),
-            owid.verify_status(&stub, "stub-shared", &[])
+            owid.verify_status(&stub, "stub-shared"),
+            owid.verify_status(&stub, "stub-shared")
         );
         assert_eq!(
             (first, second),
@@ -2097,11 +2069,11 @@ mod tests {
         let stub = Stub::end_point();
 
         assert_eq!(
-            owid.verify_status(&stub, "stub-cleared", &[]).await,
+            owid.verify_status(&stub, "stub-cleared").await,
             SignatureStatus::Valid
         );
         assert_eq!(
-            owid.verify_status(&stub, "stub-cleared", &[]).await,
+            owid.verify_status(&stub, "stub-cleared").await,
             SignatureStatus::Valid
         );
         assert_eq!(
@@ -2113,7 +2085,7 @@ mod tests {
         clear_cache();
 
         assert_eq!(
-            owid.verify_status(&stub, "stub-cleared", &[]).await,
+            owid.verify_status(&stub, "stub-cleared").await,
             SignatureStatus::Valid
         );
         assert_eq!(
@@ -2131,12 +2103,12 @@ mod tests {
         let owid = identifier();
         let stub = Stub::end_point();
         let mut context = Context::from_waker(Waker::noop());
-        let mut first = Box::pin(owid.verify_status(&stub, "stub-dropped", &[]));
+        let mut first = Box::pin(owid.verify_status(&stub, "stub-dropped"));
         assert!(
             first.as_mut().poll(&mut context).is_pending(),
             "the first caller is part way through its fetch"
         );
-        let mut second = Box::pin(owid.verify_status(&stub, "stub-dropped", &[]));
+        let mut second = Box::pin(owid.verify_status(&stub, "stub-dropped"));
         assert!(
             second.as_mut().poll(&mut context).is_pending(),
             "the second caller is waiting on the first"
@@ -2188,9 +2160,7 @@ mod tests {
             pem: key.pem.clone(),
         };
         let marker = Rc::new(());
-        let status = owid
-            .verify_status(&transport, "stub-thread-bound", &[])
-            .await;
+        let status = owid.verify_status(&transport, "stub-thread-bound").await;
         assert_eq!(
             Rc::strong_count(&marker),
             1,
@@ -2317,7 +2287,7 @@ mod tests {
             let server = KeyServer::start();
             let fetch = ReqwestFetch::new().expect("should build the transport");
             assert!(
-                owid.verify_at_url(&fetch, &server.url_for(&owid), &[])
+                owid.verify_at_url(&fetch, &server.url_for(&owid))
                     .await
                     .expect("should fetch the key and check the signature"),
                 "should verify against the key in force when it was signed"
@@ -2365,7 +2335,7 @@ mod tests {
             );
             let fetch = ReqwestFetch::new().expect("should build the transport");
             assert_eq!(
-                SignatureStatus::of(owid.verify_at_url(&fetch, &url, &[]).await),
+                SignatureStatus::of(owid.verify_at_url(&fetch, &url).await),
                 SignatureStatus::KeyUnavailable,
                 "a redirect is the key being unavailable, never a key from wherever it points"
             );
@@ -2391,7 +2361,7 @@ mod tests {
             );
             let fetch = ReqwestFetch::new().expect("should build the transport");
             assert_eq!(
-                SignatureStatus::of(owid.verify_at_url(&fetch, &url, &[]).await),
+                SignatureStatus::of(owid.verify_at_url(&fetch, &url).await),
                 SignatureStatus::KeyUnavailable,
                 "no key means the signature was never examined"
             );

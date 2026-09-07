@@ -69,11 +69,11 @@
 //! ## Signing
 //!
 //! The signing algorithm generates a SHA-256 digest of the OWID data
-//! structure without the signature field, optionally followed by the
-//! complete byte form of other OWIDs covered by the signature, and signs it
-//! with the ECDSA NIST P-256 private key of the creator. The 64 byte
-//! signature completes the OWID, and creating and signing are one step, so
-//! an OWID that exists is always signed and never changes afterwards.
+//! structure without the signature field and signs it with the ECDSA NIST
+//! P-256 private key of the creator. The signature covers the OWID's own
+//! bytes and nothing else. The 64 byte signature completes the OWID, and
+//! creating and signing are one step, so an OWID that exists is always
+//! signed and never changes afterwards.
 //!
 //! ## How an OWID comes into being
 //!
@@ -115,7 +115,7 @@
 //! // Later, or elsewhere, decode and verify with the creator public key.
 //! let copy = Owid::from_base64(&encoded).unwrap();
 //! let public_pem = crypto.public_key_pem().unwrap();
-//! assert!(copy.verify_with_public_key(&public_pem, &[]).unwrap());
+//! assert!(copy.verify_with_public_key(&public_pem).unwrap());
 //! ```
 //!
 //! ## Features

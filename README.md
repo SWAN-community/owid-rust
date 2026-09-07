@@ -138,7 +138,7 @@ let encoded = owid.as_base64().unwrap();
 // Later, or elsewhere, read it back and verify with the creator public key.
 let copy = Owid::from_base64(&encoded).unwrap();
 let public_pem = crypto.public_key_pem().unwrap();
-assert!(copy.verify_with_public_key(&public_pem, &[]).unwrap());
+assert!(copy.verify_with_public_key(&public_pem).unwrap());
 ```
 
 Read an OWID that came from outside, where data that is not an OWID is an
@@ -192,30 +192,6 @@ The whole buffer read refuses that same buffer, because there a buffer holds
 one OWID and nothing else could own the bytes after it. The two reads
 otherwise report the same reasons, differing in three answers, all listed
 under the data structure notes below.
-
-Create an OWID whose signature covers other OWIDs as well, as a processor
-does when adding itself to a transaction. The same others, in the same
-order, must be passed when verifying.
-
-```rust
-use owid::{Creator, Crypto, SignatureStatus};
-
-let root = Creator::new("root.com", Crypto::new())
-    .unwrap()
-    .create("root")
-    .unwrap();
-
-let crypto = Crypto::new();
-let processor = Creator::new("processor.com", crypto.clone()).unwrap();
-let response = processor
-    .create_with_others(b"response".to_vec(), &[&root])
-    .unwrap();
-
-// Verification must include the same others.
-assert_eq!(
-    response.verify_status_with_crypto(&crypto, &[&root]),
-    SignatureStatus::Valid);
-```
 
 Verify an OWID by fetching the creator public key from the well known end
 point. Requires the `fetch` feature and a transport that implements
@@ -279,7 +255,7 @@ use owid::{Owid, PublicKeyFetch, ReqwestFetch, SignatureStatus};
 
 async fn check(fetch: &dyn PublicKeyFetch, encoded: &str) -> SignatureStatus {
     match Owid::from_base64(encoded) {
-        Ok(owid) => owid.verify_status(fetch, "https", &[]).await,
+        Ok(owid) => owid.verify_status(fetch, "https").await,
         Err(_) => SignatureStatus::VerificationError,
     }
 }
@@ -356,10 +332,10 @@ fn response(creator: &Creator) -> String {
 |`Owid::version`, `domain`, `date`, `payload`, `signature`|Read the fields. The byte fields come back as read only views.|
 |`Owid::payload_as_string`, `payload_as_printable`, `payload_as_base64`|The payload as UTF-8 text, hexadecimal, and base 64.|
 |`Owid::age_minutes`|Complete minutes elapsed since creation.|
-|`Owid::verify_with_crypto`, `verify_with_public_key`|Verify the signature, optionally with the other OWIDs that were signed together.|
+|`Owid::verify_with_crypto`, `verify_with_public_key`|Verify the signature, which covers the OWID's own bytes and nothing else.|
 |`Owid::verify_status_with_crypto`, `verify_status_with_public_key`|The same checks, answered with a `SignatureStatus`.|
 |`Owid::verify`, `verify_status`|Verify by fetching the creator public key from the well known end point through a `PublicKeyFetch`, asynchronously (`fetch` feature).|
-|`Creator::create`, `create_with_others`|Create and sign an OWID in one step, from anything that becomes bytes. The creator sets the version, the domain and the date.|
+|`Creator::create`|Create and sign an OWID in one step, from anything that becomes bytes. The creator sets the version, the domain and the date.|
 |`Crypto::new`, `new_sign_only`, `new_verify_only`|Generate or import keys. Private keys are accepted in both PKCS#8 and SEC1 PEM forms.|
 |`Crypto::public_key_pem`, `private_key_pem`|Export keys as PEM.|
 

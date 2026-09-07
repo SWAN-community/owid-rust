@@ -154,22 +154,7 @@ impl Creator {
     /// creator.sign(&mut owid).unwrap();
     /// ```
     pub fn create(&self, payload: impl Into<Vec<u8>>) -> Result<Owid> {
-        self.create_with_others(payload, &[])
-    }
-
-    /// Creates and signs an OWID whose signature covers the other OWIDs as
-    /// well, as a processor does when adding itself to a transaction. The
-    /// same others, in the same order, must be passed when verifying.
-    ///
-    /// # Errors
-    ///
-    /// See [`Creator::create`].
-    pub fn create_with_others(
-        &self,
-        payload: impl Into<Vec<u8>>,
-        others: &[&Owid],
-    ) -> Result<Owid> {
-        self.create_version(Version::default(), payload.into(), others)
+        self.create_version(Version::default(), payload.into())
     }
 
     /// Creates and signs an OWID of the version given.
@@ -177,12 +162,7 @@ impl Creator {
     /// Crate private because versions 1 and 2 are deprecated and readable
     /// for existing data only, so nothing outside should be making one. The
     /// public creation methods arrive here with the current version.
-    pub(crate) fn create_version(
-        &self,
-        version: Version,
-        payload: Vec<u8>,
-        others: &[&Owid],
-    ) -> Result<Owid> {
+    pub(crate) fn create_version(&self, version: Version, payload: Vec<u8>) -> Result<Owid> {
         let mut owid = Owid::from_parts(
             version,
             self.domain.clone(),
@@ -190,7 +170,7 @@ impl Creator {
             payload,
             Vec::new(),
         );
-        let data = owid.data_for_crypto(others)?;
+        let data = owid.signed_bytes()?;
         let signature = self.crypto.sign_byte_array(&data)?;
         if signature.len() != crate::SIGNATURE_LENGTH {
             return Err(Error::InvalidSignatureLength(signature.len()));
@@ -255,7 +235,7 @@ mod tests {
         let creator = Creator::new("test.com", crypto.clone()).expect("should create the creator");
         for version in [Version::Version1, Version::Version2] {
             let owid = creator
-                .create_version(version, b"Hello World".to_vec(), &[])
+                .create_version(version, b"Hello World".to_vec())
                 .expect("should create");
             let encoded = owid.as_base64().expect("should encode");
             let copy = Owid::from_base64(&encoded).expect("should decode");
@@ -268,8 +248,7 @@ mod tests {
                 "signature should round trip"
             );
             assert!(
-                copy.verify_with_crypto(&crypto, &[])
-                    .expect("should verify"),
+                copy.verify_with_crypto(&crypto).expect("should verify"),
                 "a deprecated version should still verify"
             );
         }
