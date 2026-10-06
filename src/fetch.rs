@@ -1485,21 +1485,28 @@ mod tests {
     /// built from confirmed minutes, does not apply to a span the creator
     /// stated itself, so live identifiers cost one request per key rather
     /// than one per minute.
+    ///
+    /// The creator here states one key for the day either side of now. The
+    /// stand in end point answers for no moment after [`request_moment`], so
+    /// it cannot state a span that holds the minutes the clock gives.
     #[tokio::test]
     async fn a_recent_minute_is_served_where_the_creator_stated_the_span() {
         let _serialised = CACHE_TESTS.lock().await;
         clear_cache();
-        let schedule = schedule();
-        let now = Utc::now();
-        let Some(current) = key_in_force(&schedule, now) else {
-            return;
-        };
-        if next_start(&schedule, current).is_none() {
-            // The fixture schedule has no key after the one in force now.
-            return;
-        }
-        let stub = Stub::end_point();
-        let started = minutes_since_base(&now).expect("should count now");
+        let started = minutes_since_base(&Utc::now()).expect("should count now");
+        let day = 24 * 60;
+        let answer = PublicKeyAnswer::new(
+            schedule()[0].pem.clone(),
+            Some(base_date() + Duration::minutes(i64::from(started - day))),
+            Some(base_date() + Duration::minutes(i64::from(started + day))),
+        )
+        .to_json();
+        let stub = Stub::new(move |_| {
+            Ok(FetchResponse {
+                status: 200,
+                body: answer.clone(),
+            })
+        });
         pem_at(&stub, "stub-recent", started - 1).await;
         pem_at(&stub, "stub-recent", started).await;
         pem_at(&stub, "stub-recent", started - 10).await;
