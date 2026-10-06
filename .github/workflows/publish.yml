@@ -3,11 +3,22 @@ name: Publish
 # Publish the owid crate to crates.io when main changes. The job only publishes
 # when the version in Cargo.toml is not already on crates.io, so an ordinary
 # push to main (docs, tests, a fix that does not bump the version) is a no-op.
-# To release a new version, bump `version` in Cargo.toml and merge to main.
+# To release a new version, bump `version` in Cargo.toml and merge to main. A
+# bump in the major or minor place is refused unless somebody dispatches this
+# workflow and asks for it, because crates.io can never be unpublished.
 
 on:
   push:
     branches: [main]
+  # The only route that can allow a major or minor bump, so that releasing one
+  # is a person dispatching this workflow with their name on the run rather
+  # than a number merged in a manifest.
+  workflow_dispatch:
+    inputs:
+      allow-version-bump:
+        description: 'Publish even though the version moves the major or minor place.'
+        type: boolean
+        default: false
 
 # Never let two publish runs race; a second push waits for the first to finish.
 concurrency:
@@ -31,6 +42,32 @@ jobs:
           version="$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[0].version')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          # The highest version crates.io already carries, which the version
+          # check compares against. This repository keeps no tags, so the
+          # registry is the only record of what has been released.
+          #
+          # The three answers are told apart deliberately, because they mean
+          # different things and only one of them is safe to carry on from.
+          # A 404 means the crate is not there at all and this would be its
+          # first release. Anything else that fails is crates.io being
+          # unreachable, and carrying on from that would skip the check
+          # exactly when nothing is known, so it stops instead.
+          if body="$(curl -sf -H "User-Agent: owid-publish (github actions)" \
+              "https://crates.io/api/v1/crates/owid")"; then
+            released="$(printf '%s' "$body" | jq -r '.crate.max_version // empty')"
+            if [ -z "$released" ]; then
+              echo "crates.io answered for owid but named no version" >&2
+              exit 1
+            fi
+            echo "crates.io carries owid $released"
+          elif [ "$?" = "22" ]; then
+            released=""
+            echo "owid is not on crates.io, so this would be its first release."
+          else
+            echo "could not reach crates.io to find what has been released" >&2
+            exit 1
+          fi
+          echo "released=$released" >> "$GITHUB_OUTPUT"
           # The crates.io API returns 200 for a published version and 404
           # otherwise. A User-Agent is required by the API.
           if curl -sf -H "User-Agent: owid-publish (github actions)" \
@@ -41,6 +78,40 @@ jobs:
             echo "owid $version is not on crates.io; it will be published."
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # The same check the 51Degrees packages publish through, taken from
+      # common-ci rather than copied here, so there is one rule and not two
+      # that drift apart.
+      - name: Checkout common-ci
+        if: steps.check.outputs.publish == 'true' && steps.check.outputs.released != ''
+        uses: actions/checkout@v4
+        with:
+          repository: 51Degrees/common-ci
+          path: common-ci
+
+      # Refuses a version that moves the major or minor place unless this run
+      # was dispatched by someone who asked for it. A push to main carries no
+      # inputs, so that route can never allow one and no merge can release a
+      # new major by itself.
+      #
+      # This repository keeps no tags, so the check is told what crates.io
+      # already carries rather than reading a release history that is not
+      # here. Without that it would find nothing, call every version the
+      # first one, and pass everything.
+      #
+      # Skipped only where the step above established that the crate is not
+      # on crates.io at all, since a first release has nothing to move away
+      # from. Being unable to reach crates.io stops that step instead of
+      # reaching here.
+      - name: Refuse a major or minor bump nobody approved
+        if: steps.check.outputs.publish == 'true' && steps.check.outputs.released != ''
+        shell: pwsh
+        env:
+          ALLOW_VERSION_BUMP: ${{ inputs.allow-version-bump }}
+        run: >-
+          ./common-ci/steps/check-version-bump.ps1
+          -Version '${{ steps.check.outputs.version }}'
+          -ReleasedVersion '${{ steps.check.outputs.released }}'
 
       - name: Publish to crates.io
         if: steps.check.outputs.publish == 'true'
